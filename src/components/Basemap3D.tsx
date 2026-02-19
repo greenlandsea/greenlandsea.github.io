@@ -80,24 +80,41 @@ async function tryLoadBathyJson(): Promise<BathyGrid | null> {
     if (!Array.isArray(json?.lon) || !Array.isArray(json?.lat) || !Array.isArray(json?.z)) {
       return null;
     }
-    // Accept either convention:
-    // - negative meters below sea level (preferred)
-    // - positive depth in meters (common in ocean models)
-    // If the grid is entirely non-negative, flip sign so Plotly shows a basin.
-    let min = Infinity;
-    let max = -Infinity;
-    for (let j = 0; j < Math.min(json.z.length, 40); j++) {
+
+    // Determine sign convention robustly (avoid sampling bias: RTopo often has land in the top-left).
+    // Conventions we support:
+    // - ocean depth already negative (preferred): keep as-is
+    // - ocean depth positive-down (common): flip sign so Plotly shows a basin
+    // If both positive and negative exist, assume:
+    // - positive => land elevation (clamp to 0 to focus on ocean)
+    // - negative => ocean depth
+    let hasNeg = false;
+    let hasPos = false;
+    outer: for (let j = 0; j < json.z.length; j++) {
       const row = json.z[j];
       if (!Array.isArray(row)) continue;
-      for (let i = 0; i < Math.min(row.length, 40); i++) {
+      for (let i = 0; i < row.length; i++) {
         const v = Number((row as any)[i]);
-        if (!Number.isFinite(v)) continue;
-        min = Math.min(min, v);
-        max = Math.max(max, v);
+        if (!Number.isFinite(v) || v === 0) continue;
+        if (v < 0) hasNeg = true;
+        if (v > 0) hasPos = true;
+        if (hasNeg && hasPos) break outer;
       }
     }
-    if (Number.isFinite(min) && min >= 0 && max > 0) {
+
+    // If the grid has no negatives but has positives, treat it as "positive-down depth" and flip.
+    if (!hasNeg && hasPos) {
       json.z = json.z.map((row) => (Array.isArray(row) ? row.map((v) => -Number(v)) : row)) as any;
+      hasNeg = true;
+      hasPos = false;
+    }
+
+    // If we have both land (positive) and ocean (negative), clamp land to sea-level so depth scaling
+    // focuses on the ocean.
+    if (hasNeg) {
+      json.z = json.z.map((row) =>
+        Array.isArray(row) ? row.map((v) => Math.min(0, Number(v))) : row
+      ) as any;
     }
 
     // Plotly surface performance: keep grid under a manageable size.
