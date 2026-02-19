@@ -8,7 +8,6 @@ dist
 public/data/*.zarr/
 public/data/*.nc
 
-# If you *do* want to publish the Greenland Sea Zarr store via GitHub Pages,
-# uncomment the following two lines (or remove the ignore above):
+# Allow publishing this specific Greenland Sea Zarr store via GitHub Pages.
 !public/data/GS.zarr/
 !public/data/GS.zarr/**
