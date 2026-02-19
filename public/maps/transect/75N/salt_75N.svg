@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700">
+  <defs>
+    <linearGradient id="g" x1="0" x2="1">
+      <stop offset="0" stop-color="#0b2b4a"/>
+      <stop offset="0.5" stop-color="#124f6a"/>
+      <stop offset="1" stop-color="#67e8f9"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="700" fill="url(#g)"/>
+  <rect x="80" y="70" width="1040" height="540" fill="rgba(0,0,0,0.16)" stroke="rgba(255,255,255,0.28)" stroke-width="2"/>
+  <text x="100" y="115" fill="rgba(255,255,255,0.9)" font-family="ui-monospace, Menlo, monospace" font-size="28">Salinity transect @ 75°N — placeholder</text>
+  <text x="100" y="155" fill="rgba(255,255,255,0.75)" font-family="ui-monospace, Menlo, monospace" font-size="18">x: longitude   y: depth (m)</text>
+  <text x="100" y="610" fill="rgba(255,255,255,0.65)" font-family="ui-monospace, Menlo, monospace" font-size="16">Drop your PNG at public/maps/transect/75N/salt_75N.png</text>
+</svg>
+

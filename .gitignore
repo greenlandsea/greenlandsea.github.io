@@ -1,0 +1,9 @@
+.DS_Store
+node_modules
+dist
+*.log
+
+# Large local datasets (keep out of Git unless using LFS)
+public/data/GS.zarr/
+public/data/*.zarr/
+public/data/*.nc
