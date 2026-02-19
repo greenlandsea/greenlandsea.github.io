@@ -32,7 +32,7 @@ Add `public/data/bathy.json` (see `public/data/README.md`) to drive the Plotly 3
 
 For large 4D datasets (lon/lat/depth/time), the recommended path is **Zarr** in `public/data/GS.zarr/` so the site can fetch only the chunks it needs.
 
-- Put your Zarr store at `public/data/GS.zarr/`
+- Put your Zarr store at `public/data/GS_web.zarr/` (preferred) or `public/data/GS.zarr/`
 - Run the site with `npm start`
 
 The UI lets you:
@@ -46,7 +46,7 @@ The UI lets you:
 
 By default the site loads the Zarr store from:
 
-- `public/data/GS.zarr/` (served as `.../data/GS.zarr/`)
+- `public/data/GS_web.zarr/` if present, otherwise `public/data/GS.zarr/`
 
 You can override the dataset location:
 
