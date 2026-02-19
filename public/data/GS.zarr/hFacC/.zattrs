@@ -1,0 +1,9 @@
+{
+  "standard_name": "cell_vertical_fraction",
+  "long_name": "vertical fraction of open cell",
+  "_ARRAY_DIMENSIONS": [
+    "Z",
+    "YC",
+    "XC"
+  ]
+}

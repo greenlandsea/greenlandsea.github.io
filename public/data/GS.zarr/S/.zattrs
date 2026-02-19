@@ -1,0 +1,12 @@
+{
+  "standard_name": "sea_water_salinity",
+  "long_name": "Salinity",
+  "units": "g kg-1",
+  "coordinates": "Depth PHrefC drC drF dxF dyF hFacC iter maskC maskInC rA rhoRef",
+  "_ARRAY_DIMENSIONS": [
+    "time",
+    "Z",
+    "YC",
+    "XC"
+  ]
+}

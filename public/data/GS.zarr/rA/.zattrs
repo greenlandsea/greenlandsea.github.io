@@ -1,0 +1,10 @@
+{
+  "standard_name": "cell_area",
+  "long_name": "cell area",
+  "units": "m2",
+  "coordinate": "YC XC",
+  "_ARRAY_DIMENSIONS": [
+    "YC",
+    "XC"
+  ]
+}

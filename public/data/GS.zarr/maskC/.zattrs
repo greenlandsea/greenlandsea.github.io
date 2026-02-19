@@ -1,0 +1,10 @@
+{
+  "standard_name": "sea_binary_mask_at_t_location",
+  "long_name": "mask denoting wet point at center",
+  "dtype": "bool",
+  "_ARRAY_DIMENSIONS": [
+    "Z",
+    "YC",
+    "XC"
+  ]
+}

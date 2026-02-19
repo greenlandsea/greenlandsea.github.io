@@ -1,0 +1,9 @@
+{
+  "standard_name": "reference_density_profile",
+  "long_name": "1D, vertical reference density profile",
+  "coordinate": "Z",
+  "units": "kg m-3",
+  "_ARRAY_DIMENSIONS": [
+    "Z"
+  ]
+}

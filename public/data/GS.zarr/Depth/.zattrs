@@ -1,0 +1,10 @@
+{
+  "standard_name": "ocean_depth",
+  "long_name": "ocean depth",
+  "units": "m",
+  "coordinate": "XC YC",
+  "_ARRAY_DIMENSIONS": [
+    "YC",
+    "XC"
+  ]
+}

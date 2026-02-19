@@ -1,0 +1,10 @@
+{
+  "standard_name": "depth",
+  "long_name": "vertical coordinate of cell center",
+  "units": "m",
+  "positive": "down",
+  "axis": "Z",
+  "_ARRAY_DIMENSIONS": [
+    "Z"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "standard_name": "longitude",
+  "long_name": "longitude",
+  "units": "degrees_east",
+  "coordinate": "YC XC",
+  "axis": "X",
+  "_ARRAY_DIMENSIONS": [
+    "XC"
+  ]
+}
