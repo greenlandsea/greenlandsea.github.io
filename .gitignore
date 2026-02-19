@@ -7,7 +7,4 @@ dist
 # Large local datasets (keep out of Git unless using LFS)
 public/data/*.zarr/
 public/data/*.nc
-
-# Allow publishing this specific Greenland Sea Zarr store via GitHub Pages.
-!public/data/GS.zarr/
-!public/data/GS.zarr/**
+public/data/bathy_RTopo.json

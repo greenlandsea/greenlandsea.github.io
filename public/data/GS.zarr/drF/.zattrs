@@ -1,8 +1,0 @@
-{
-  "standard_name": "cell_z_size",
-  "long_name": "cell z size",
-  "units": "m",
-  "_ARRAY_DIMENSIONS": [
-    "Z"
-  ]
-}

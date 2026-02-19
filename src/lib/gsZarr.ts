@@ -44,7 +44,7 @@ function configuredStoreUrl() {
   const envUrl = (import.meta as any)?.env?.VITE_GS_ZARR_URL;
   if (typeof envUrl === "string" && envUrl.trim()) return envUrl.trim();
 
-  return withBase("data/GS.zarr");
+  return "";
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -107,11 +107,24 @@ function reshape2D(data: ArrayLike<number>, nRows: number, nCols: number): numbe
 type BathyGrid = { lon: number[]; lat: number[] };
 
 async function loadBathyLonLat(): Promise<BathyGrid> {
-  const j = await fetchJson<any>(withBase("data/bathy.json"));
-  if (!Array.isArray(j?.lon) || !Array.isArray(j?.lat)) {
-    throw new Error("public/data/bathy.json missing lon/lat arrays");
+  // Fallback only (used if lon/lat cannot be read from the Zarr store).
+  // Prefer the smaller bathy.json if present; RTopo can be extremely high-res.
+  const candidates = [withBase("data/bathy.json"), withBase("data/bathy_RTopo.json")];
+  let lastErr: unknown = null;
+  for (const url of candidates) {
+    try {
+      const j = await fetchJson<any>(url);
+      if (!Array.isArray(j?.lon) || !Array.isArray(j?.lat)) continue;
+      return { lon: j.lon.map(Number), lat: j.lat.map(Number) };
+    } catch (e) {
+      lastErr = e;
+    }
   }
-  return { lon: j.lon.map(Number), lat: j.lat.map(Number) };
+  throw new Error(
+    `Failed to load lon/lat from bathymetry json (tried ${candidates.join(", ")}): ${String(
+      (lastErr as any)?.message ?? lastErr
+    )}`
+  );
 }
 
 const arrayPromiseCache = new Map<string, Promise<any>>();
@@ -127,19 +140,90 @@ async function openArray(storeUrl: string, name: string) {
 
 export async function loadGsZarrMeta(): Promise<GsZarrMeta> {
   // zarrita's FetchStore requires an absolute URL for `new URL(root)`.
-  const storeUrl = normalizeBaseUrl(toAbsoluteUrl(configuredStoreUrl()));
+  const configured = configuredStoreUrl();
+  const candidates = configured
+    ? [configured]
+    : [withBase("data/GS_web.zarr"), withBase("data/GS.zarr")];
 
-  // Read consolidated metadata for labels/units when available.
+  let storeUrl = "";
   let zmeta: ZMetadata | null = null;
-  try {
-    zmeta = await fetchJson<ZMetadata>(`${storeUrl}/.zmetadata`);
-  } catch {
-    zmeta = null;
+  let lastErr: unknown = null;
+  for (const c of candidates) {
+    const u = normalizeBaseUrl(toAbsoluteUrl(c));
+    try {
+      zmeta = await fetchJson<ZMetadata>(`${u}/.zmetadata`);
+      storeUrl = u;
+      break;
+    } catch (e) {
+      lastErr = e;
+      zmeta = null;
+      storeUrl = "";
+    }
+  }
+  if (!storeUrl) {
+    throw new Error(
+      `Could not find a readable Zarr store. Tried: ${candidates.join(", ")}. Last error: ${String(
+        (lastErr as any)?.message ?? lastErr
+      )}`
+    );
   }
 
   const bathy = await loadBathyLonLat();
 
   const timeUnits = String(zmeta?.metadata?.["time/.zattrs"]?.units ?? "seconds since 1970-01-01");
+
+  const lonLat = await (async () => {
+    try {
+      // Common names for coordinates in this project.
+      const lonArr = await openArray(storeUrl, "lon");
+      const latArr = await openArray(storeUrl, "lat");
+      const lonFull = await zarr.get(lonArr);
+      const latFull = await zarr.get(latArr);
+      const shape = lonFull.shape;
+      const latShape = latFull.shape;
+      const tol = 1e-6;
+
+      // 1D regular axes
+      if (shape.length === 1 && latShape.length === 1) {
+        const lon = Array.from(lonFull.data as any, (v: any) => Number(v));
+        const lat = Array.from(latFull.data as any, (v: any) => Number(v));
+        if (lon.length && lat.length) return { lon, lat };
+        return bathy;
+      }
+
+      // 2D "regular" grid represented as lon(lat,lon) and lat(lat,lon).
+      if (shape.length === 2 && latShape.length === 2 && shape[0] === latShape[0] && shape[1] === latShape[1]) {
+        const nLat = shape[0];
+        const nLon = shape[1];
+        const lonData = lonFull.data as any;
+        const latData = latFull.data as any;
+
+        const lon1d: number[] = new Array(nLon);
+        for (let i = 0; i < nLon; i++) lon1d[i] = Number(lonData[i]);
+
+        const lat1d: number[] = new Array(nLat);
+        for (let j = 0; j < nLat; j++) lat1d[j] = Number(latData[j * nLon]);
+
+        // Verify regularity: lon constant across rows; lat constant across cols.
+        for (let i = 0; i < nLon; i++) {
+          const a = lon1d[i];
+          const b = Number(lonData[(nLat - 1) * nLon + i]);
+          if (Math.abs(a - b) > tol) throw new Error("lon(lat,lon) is not constant across rows");
+        }
+        for (let j = 0; j < nLat; j++) {
+          const a = lat1d[j];
+          const b = Number(latData[j * nLon + (nLon - 1)]);
+          if (Math.abs(a - b) > tol) throw new Error("lat(lat,lon) is not constant across columns");
+        }
+
+        return { lon: lon1d, lat: lat1d };
+      }
+
+      return bathy;
+    } catch {
+      return bathy;
+    }
+  })();
 
   // Coordinates (best-effort). If the coordinate arrays use an unsupported codec, we fall back to indices.
   const timeArr = await openArray(storeUrl, "time");
@@ -189,8 +273,8 @@ export async function loadGsZarrMeta(): Promise<GsZarrMeta> {
 
   return {
     storeUrl,
-    lon: bathy.lon,
-    lat: bathy.lat,
+    lon: lonLat.lon,
+    lat: lonLat.lat,
     z: zVals,
     timeIso,
     variables,

@@ -1,7 +1,0 @@
-{
-  "standard_name": "timestep",
-  "long_name": "model timestep number",
-  "_ARRAY_DIMENSIONS": [
-    "time"
-  ]
-}

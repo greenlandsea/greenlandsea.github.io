@@ -132,6 +132,8 @@ export default function App() {
 
   const timeList = meta?.timeIso ?? [];
   const zList = meta?.z ?? [];
+  const latMin = meta?.lat?.length ? Math.min(...meta.lat) : 71;
+  const latMax = meta?.lat?.length ? Math.max(...meta.lat) : 81.5;
   const safeTimeIdx = Math.max(0, Math.min(timeIdx, Math.max(0, timeList.length - 1)));
   const safeDepthIdx = Math.max(0, Math.min(depthIdx, Math.max(0, zList.length - 1)));
   const activeTimeLabel = timeList[safeTimeIdx] ?? "n/a";
@@ -255,6 +257,8 @@ export default function App() {
     return {
       enabled: true,
       values: horizontalValues,
+      lon: meta.lon,
+      lat: meta.lat,
       cmin: settings.cmin,
       cmax: settings.cmax,
       colorscale,
@@ -549,8 +553,8 @@ export default function App() {
                 <input
                   type="number"
                   value={latTarget}
-                  min={72}
-                  max={79}
+                  min={latMin}
+                  max={latMax}
                   step={0.1}
                   onChange={(e) => setLatTarget(Number(e.target.value))}
                   disabled={metaStatus !== "ready"}

@@ -1,6 +1,0 @@
-{
-  "Conventions": "CF-1.6",
-  "title": "netCDF wrapper of MITgcm MDS binary data",
-  "source": "MITgcm",
-  "history": "Created by calling `open_mdsdataset(data_dir='/gpfs/home/bve23zsu/nordic/nordic2.out', grid_dir=None, iters=None, prefix=['T', 'Eta', 'U', 'V', 'S', 'PH', 'W'], read_grid=True, delta_t=90, ref_date='1993-08-01T00', calendar='gregorian', levels=None, geometry='sphericalpolar', grid_vars_to_coords=False, swap_dims=False, endian='>', chunks={}, ignore_unknown_vars=True, default_dtype='float32', nx=None, ny=None, nz=None, llc_method='smallchunks', extra_metadata=None, extra_variables=None)`"
-}

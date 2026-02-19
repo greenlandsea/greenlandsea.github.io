@@ -32,7 +32,11 @@ type LonDepthBounds = {
 
 type HorizontalField = {
   enabled: boolean;
+  // values are on a (lat x lon) grid. If the grid differs from the bathymetry grid,
+  // provide lon/lat for resampling onto the bathy surface.
   values: number[][];
+  lon?: number[];
+  lat?: number[];
   cmin: number;
   cmax: number;
   colorscale: Array<[number, string]>;
@@ -64,9 +68,15 @@ type TransectField = {
 
 async function tryLoadBathyJson(): Promise<BathyGrid | null> {
   try {
-    const r = await fetch(withBase("data/bathy.json"), { cache: "no-store" });
-    if (!r.ok) return null;
-    const json = (await r.json()) as BathyGrid;
+    const candidates = [withBase("data/bathy_RTopo.json"), withBase("data/bathy.json")];
+    let json: BathyGrid | null = null;
+    for (const url of candidates) {
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) continue;
+      json = (await r.json()) as BathyGrid;
+      break;
+    }
+    if (!json) return null;
     if (!Array.isArray(json?.lon) || !Array.isArray(json?.lat) || !Array.isArray(json?.z)) {
       return null;
     }
@@ -89,6 +99,34 @@ async function tryLoadBathyJson(): Promise<BathyGrid | null> {
     if (Number.isFinite(min) && min >= 0 && max > 0) {
       json.z = json.z.map((row) => (Array.isArray(row) ? row.map((v) => -Number(v)) : row)) as any;
     }
+
+    // Plotly surface performance: keep grid under a manageable size.
+    // RTopo can be thousands x thousands; downsample deterministically.
+    const nLat = json.lat.length;
+    const nLon = json.lon.length;
+    const maxPoints = 250_000;
+    const nPoints = nLat * nLon;
+    if (nPoints > maxPoints && nLat > 0 && nLon > 0) {
+      const targetLat = Math.max(80, Math.floor(Math.sqrt((maxPoints * nLat) / nLon)));
+      const targetLon = Math.max(80, Math.floor(maxPoints / targetLat));
+      const strideLat = Math.max(1, Math.ceil(nLat / targetLat));
+      const strideLon = Math.max(1, Math.ceil(nLon / targetLon));
+
+      const latIdx: number[] = [];
+      for (let j = 0; j < nLat; j += strideLat) latIdx.push(j);
+      if (latIdx[latIdx.length - 1] !== nLat - 1) latIdx.push(nLat - 1);
+
+      const lonIdx: number[] = [];
+      for (let i = 0; i < nLon; i += strideLon) lonIdx.push(i);
+      if (lonIdx[lonIdx.length - 1] !== nLon - 1) lonIdx.push(nLon - 1);
+
+      json = {
+        lon: lonIdx.map((i) => Number(json!.lon[i])),
+        lat: latIdx.map((j) => Number(json!.lat[j])),
+        z: latIdx.map((j) => lonIdx.map((i) => Number((json!.z as any)[j][i]))),
+      };
+    }
+
     return json;
   } catch {
     return null;
@@ -438,9 +476,53 @@ export default function Basemap3D(props: {
     const overlayMode = numericH?.mode ?? props.horizontalOverlay?.mode ?? "surface";
     const textureOnBathy = overlayEnabled && overlayMode === "bathy";
 
-    const overlaySurfacecolor = (numericH?.values ?? horizontalColor?.surfacecolor) as
-      | number[][]
-      | undefined;
+    const overlaySurfacecolor = (() => {
+      const fieldValues = numericH?.values;
+      if (!fieldValues) return horizontalColor?.surfacecolor as any;
+      const nRows = fieldValues.length;
+      const nCols = fieldValues[0]?.length ?? 0;
+      if (nRows === bathy.lat.length && nCols === bathy.lon.length) return fieldValues;
+      if (!numericH?.lon || !numericH?.lat) return fieldValues;
+
+      // Nearest-neighbor resampling from field grid onto bathy grid.
+      // Precompute lon/lat index maps.
+      const lonMap = bathy.lon.map((x) => {
+        let best = 0;
+        let bestD = Infinity;
+        for (let i = 0; i < numericH.lon!.length; i++) {
+          const d = Math.abs(numericH.lon![i] - x);
+          if (d < bestD) {
+            bestD = d;
+            best = i;
+          }
+        }
+        return best;
+      });
+      const latMap = bathy.lat.map((y) => {
+        let best = 0;
+        let bestD = Infinity;
+        for (let j = 0; j < numericH.lat!.length; j++) {
+          const d = Math.abs(numericH.lat![j] - y);
+          if (d < bestD) {
+            bestD = d;
+            best = j;
+          }
+        }
+        return best;
+      });
+
+      const out: number[][] = new Array(bathy.lat.length);
+      for (let j = 0; j < bathy.lat.length; j++) {
+        const srcJ = latMap[j];
+        const srcRow = fieldValues[srcJ] ?? [];
+        const row: number[] = new Array(bathy.lon.length);
+        for (let i = 0; i < bathy.lon.length; i++) {
+          row[i] = Number(srcRow[lonMap[i]]);
+        }
+        out[j] = row;
+      }
+      return out;
+    })();
     const overlayColorscale = (numericH?.colorscale ?? horizontalColor?.colorscale) as
       | Array<[number, string]>
       | undefined;
