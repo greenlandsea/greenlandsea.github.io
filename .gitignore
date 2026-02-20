@@ -8,3 +8,4 @@ dist
 public/data/*.zarr/
 public/data/*.nc
 public/data/bathy_RTopo.json
+public/data/bathy_RTopo_ds.json

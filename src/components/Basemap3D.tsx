@@ -76,9 +76,35 @@ type TransectField = {
 
 async function tryLoadBathyJson(): Promise<BathyGrid | null> {
   try {
-    const candidates = [withBase("data/bathy_RTopo.json"), withBase("data/bathy.json")];
+    const forceFull =
+      typeof window !== "undefined" &&
+      new URLSearchParams(window.location.search).get("bathy") === "rtopo";
+
+    const candidates = [
+      withBase("data/bathy_RTopo_ds.json"),
+      withBase("data/bathy_RTopo.json"),
+      withBase("data/bathy.json"),
+    ];
     let json: BathyGrid | null = null;
     for (const url of candidates) {
+      // Avoid loading huge JSON by accident; prefer a downsampled file.
+      if (!forceFull && url.endsWith("bathy_RTopo.json")) {
+        try {
+          const head = await fetch(url, { method: "HEAD" });
+          const len = Number(head.headers.get("Content-Length") ?? "0");
+          // ~30MB threshold: above this, parsing can freeze the tab on many machines.
+          if (Number.isFinite(len) && len > 30 * 1024 * 1024) {
+            // Skip; fall back to ds or bathy.json.
+            console.warn(
+              `Skipping ${url} (${Math.round(len / (1024 * 1024))} MB). ` +
+                `Create bathy_RTopo_ds.json for performance, or force with ?bathy=rtopo.`
+            );
+            continue;
+          }
+        } catch {
+          // ignore HEAD errors; try GET anyway
+        }
+      }
       const r = await fetch(url, { cache: "no-store" });
       if (!r.ok) continue;
       json = (await r.json()) as BathyGrid;

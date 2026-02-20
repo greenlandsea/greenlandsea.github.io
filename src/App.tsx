@@ -94,8 +94,8 @@ export default function App() {
   );
   const [showSeaIce, setShowSeaIce] = useState(true);
   const [seaIceOpacity, setSeaIceOpacity] = useState(0.55);
-  const [stackSlices, setStackSlices] = useState(10);
-  const [stackOpacity, setStackOpacity] = useState(0.14);
+  const [stackSlices, setStackSlices] = useState(8);
+  const [stackOpacity, setStackOpacity] = useState(0.16);
 
   const [timeIdx, setTimeIdx] = useState(0);
   const [depthIdx, setDepthIdx] = useState(0);
@@ -213,14 +213,10 @@ export default function App() {
     (async () => {
       try {
         if (viewMode === "water3d") {
-          const v3 = await load3DFieldAtTime({
-            storeUrl: meta.storeUrl,
-            varId,
-            tIndex: safeTimeIdx,
-          });
-          const ice = showSeaIce
-            ? await loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex: safeTimeIdx })
-            : null;
+          const [v3, ice] = await Promise.all([
+            load3DFieldAtTime({ storeUrl: meta.storeUrl, varId, tIndex: safeTimeIdx }),
+            showSeaIce ? loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex: safeTimeIdx }) : Promise.resolve(null),
+          ]);
           if (cancelled) return;
           setField3d(v3);
           setSeaIceValues(ice);

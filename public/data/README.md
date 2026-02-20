@@ -6,6 +6,7 @@ Create:
 
 - `public/data/bathy.json`
 - Optionally: `public/data/bathy_RTopo.json` (higher resolution; large JSON)
+- Recommended for performance: `public/data/bathy_RTopo_ds.json` (downsampled)
 
 Format:
 
@@ -27,3 +28,11 @@ This app also accepts **positive depth** (meters, positive downward). If the ent
 ## Performance note (RTopo)
 
 `bathy_RTopo.json` can be very large. The app will downsample it after loading to keep Plotly responsive, but the initial download/parse may still be heavy.
+
+To generate a small file for fast local use:
+
+```bash
+python scripts/downsample_bathy_rtopo.py
+```
+
+The app will prefer `bathy_RTopo_ds.json` if present.
