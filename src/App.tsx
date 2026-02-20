@@ -1,20 +1,17 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Basemap3D from "./components/Basemap3D";
-import { blues_r_256, paletteToColorscale, rdylbu_r_256 } from "./lib/colormap";
+import { ice_256, paletteToColorscale, rdylbu_r_256 } from "./lib/colormap";
 import {
   loadGsZarrMeta,
   loadHorizontalSlice,
-  load3DFieldAtTime,
   loadSeaIce2D,
   loadTransectSlice,
   nearestIndex,
-  slice3DTo2D,
   type GsZarrMeta,
 } from "./lib/gsZarr";
 
-type ViewMode = "water3d" | "horizontal" | "transect";
+type ViewMode = "horizontal" | "transect";
 type VarId = "T" | "S";
-type ProjectionMode = "surface" | "bathy";
 type ColorscaleMode = "continuous" | "discrete";
 
 type VarColorSettings = {
@@ -24,6 +21,10 @@ type VarColorSettings = {
   mode: ColorscaleMode;
   levels: number; // used when mode === "discrete"
 };
+
+function clamp(n: number, min: number, max: number) {
+  return Math.min(Math.max(n, min), max);
+}
 
 function defaultRange(varId: VarId) {
   if (varId === "T") return { min: -1, max: 5, ticks: [-1, 0, 1, 2, 3, 4, 5], title: "Temperature (°C)" };
@@ -81,27 +82,80 @@ function makeDiscreteColorscale(levels: number) {
   return out;
 }
 
+function ToggleSwitch(props: {
+  checked: boolean;
+  onCheckedChange: (next: boolean) => void;
+  disabled?: boolean;
+  title?: string;
+}) {
+  const { checked, onCheckedChange, disabled, title } = props;
+  return (
+    <button
+      type="button"
+      className={`toggle ${checked ? "toggleOn" : ""}`}
+      onClick={() => {
+        if (disabled) return;
+        onCheckedChange(!checked);
+      }}
+      disabled={disabled}
+      role="switch"
+      aria-checked={checked}
+      title={title}
+    >
+      <span className="toggleKnob" />
+    </button>
+  );
+}
+
 export default function App() {
-  const [viewMode, setViewMode] = useState<ViewMode>("water3d");
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const [cameraResetNonce, setCameraResetNonce] = useState(0);
+  const [panelOpen, setPanelOpen] = useState(() => {
+    try {
+      const v = window.localStorage.getItem("gs_panel_open");
+      if (v != null) return v === "1";
+    } catch {
+      // ignore
+    }
+    return false;
+  });
+  const [panelPos, setPanelPos] = useState<{ left: number; top: number } | null>(null);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("gs_panel_open", panelOpen ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  }, [panelOpen]);
+
+  const [viewMode, setViewMode] = useState<ViewMode>("horizontal");
   const [varId, setVarId] = useState<VarId>("T");
-  const [projectOn3d, setProjectOn3d] = useState(true);
-  const [projectionMode, setProjectionMode] = useState<ProjectionMode>("surface");
+  const projectOn3d = true;
   const [overlayOpacity, setOverlayOpacity] = useState(0.9);
   const [showColorbar, setShowColorbar] = useState(true);
+  const [showFieldContours, setShowFieldContours] = useState(false);
   const [showBathyContours, setShowBathyContours] = useState(false);
+  const [depthRatio, setDepthRatio] = useState(0.35);
+  const [depthWarpMode, setDepthWarpMode] = useState<"linear" | "upper">("upper");
+  const [depthFocusM, setDepthFocusM] = useState(2500);
+  const [deepRatio, setDeepRatio] = useState(0.25);
+  const [showBathyInTransect, setShowBathyInTransect] = useState(true);
   const [colorSettings, setColorSettings] = useState<Record<VarId, VarColorSettings>>(
     DEFAULT_COLOR_SETTINGS
   );
   const [showSeaIce, setShowSeaIce] = useState(true);
   const [seaIceOpacity, setSeaIceOpacity] = useState(0.55);
-  const [stackSlices, setStackSlices] = useState(8);
-  const [stackOpacity, setStackOpacity] = useState(0.16);
+  const [showSeaIceColorbar, setShowSeaIceColorbar] = useState(true);
+  const [seaIceMin, setSeaIceMin] = useState(0.3);
+  const [seaIceHeightM, setSeaIceHeightM] = useState(5);
+  const [bathySource, setBathySource] = useState<"auto" | "bathy" | "rtopo_ds" | "rtopo">("bathy");
 
   const [timeIdx, setTimeIdx] = useState(0);
   const [depthIdx, setDepthIdx] = useState(0);
   const [latTarget, setLatTarget] = useState(75);
   const [playing, setPlaying] = useState(false);
-  const [fps, setFps] = useState(2);
+  const [fps, setFps] = useState(1);
 
   const [metaStatus, setMetaStatus] = useState<"loading" | "ready" | "failed">("loading");
   const [metaError, setMetaError] = useState<string | null>(null);
@@ -112,12 +166,14 @@ export default function App() {
   );
   const [sliceError, setSliceError] = useState<string | null>(null);
 
+  const [seaIceStatus, setSeaIceStatus] = useState<"off" | "loading" | "ready" | "failed">(
+    "off"
+  );
+  const [seaIceError, setSeaIceError] = useState<string | null>(null);
+
   const [horizontalValues, setHorizontalValues] = useState<number[][] | null>(null);
   const [transectValues, setTransectValues] = useState<number[][] | null>(null);
   const [transectLatActual, setTransectLatActual] = useState<number | null>(null);
-  const [field3d, setField3d] = useState<{ data: Float32Array; nz: number; ny: number; nx: number } | null>(
-    null
-  );
   const [seaIceValues, setSeaIceValues] = useState<number[][] | null>(null);
 
   const [bathyInfo, setBathyInfo] = useState<{
@@ -139,6 +195,21 @@ export default function App() {
   const colorbarTicks = useMemo(
     () => (settings.tickCount > 0 ? makeTicks(settings.cmin, settings.cmax, settings.tickCount) : undefined),
     [settings.cmax, settings.cmin, settings.tickCount]
+  );
+  const hasSeaIceColorbar = projectOn3d && showSeaIce && showSeaIceColorbar;
+  const mainColorbarLayout = useMemo(
+    () =>
+      hasSeaIceColorbar
+        ? { x: 1.03, y: 0.78, len: 0.42 }
+        : { x: 1.03, y: 0.52, len: 0.72 },
+    [hasSeaIceColorbar]
+  );
+  const seaIceColorbarLayout = useMemo(
+    () =>
+      hasSeaIceColorbar
+        ? { x: 1.03, y: 0.20, len: 0.26 }
+        : { x: 1.03, y: 0.52, len: 0.72 },
+    [hasSeaIceColorbar]
   );
 
   const timeList = meta?.timeIso ?? [];
@@ -188,10 +259,13 @@ export default function App() {
     if (metaStatus !== "ready" || !timeList.length) return;
     const intervalMs = Math.max(250, Math.round(1000 / Math.max(0.5, fps)));
     const t = window.setInterval(() => {
+      // Avoid stepping time while the current frame is still loading.
+      if (sliceStatus === "loading") return;
+      if (showSeaIce && seaIceStatus === "loading") return;
       setTimeIdx((i) => (i + 1) % timeList.length);
     }, intervalMs);
     return () => window.clearInterval(t);
-  }, [fps, metaStatus, playing, timeList.length]);
+  }, [fps, metaStatus, playing, seaIceStatus, showSeaIce, sliceStatus, timeList.length]);
 
   useEffect(() => {
     if (!meta || metaStatus !== "ready") return;
@@ -201,8 +275,6 @@ export default function App() {
       setHorizontalValues(null);
       setTransectValues(null);
       setTransectLatActual(null);
-      setField3d(null);
-      setSeaIceValues(null);
       return;
     }
 
@@ -212,19 +284,7 @@ export default function App() {
 
     (async () => {
       try {
-        if (viewMode === "water3d") {
-          const [v3, ice] = await Promise.all([
-            load3DFieldAtTime({ storeUrl: meta.storeUrl, varId, tIndex: safeTimeIdx }),
-            showSeaIce ? loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex: safeTimeIdx }) : Promise.resolve(null),
-          ]);
-          if (cancelled) return;
-          setField3d(v3);
-          setSeaIceValues(ice);
-          setHorizontalValues(null);
-          setTransectValues(null);
-          setTransectLatActual(null);
-          setSliceStatus("ready");
-        } else if (viewMode === "horizontal") {
+        if (viewMode === "horizontal") {
           const values = await loadHorizontalSlice({
             storeUrl: meta.storeUrl,
             varId,
@@ -237,8 +297,6 @@ export default function App() {
           setHorizontalValues(values);
           setTransectValues(null);
           setTransectLatActual(null);
-          setField3d(null);
-          setSeaIceValues(null);
           setSliceStatus("ready");
         } else {
           const yIndex = nearestIndex(meta.lat, latTarget);
@@ -252,8 +310,6 @@ export default function App() {
           setTransectValues(values);
           setHorizontalValues(null);
           setTransectLatActual(meta.lat[yIndex] ?? latTarget);
-          setField3d(null);
-          setSeaIceValues(null);
           setSliceStatus("ready");
         }
       } catch (e) {
@@ -264,8 +320,6 @@ export default function App() {
         setHorizontalValues(null);
         setTransectValues(null);
         setTransectLatActual(null);
-        setField3d(null);
-        setSeaIceValues(null);
       }
     })();
 
@@ -281,7 +335,78 @@ export default function App() {
     safeTimeIdx,
     varId,
     viewMode,
+  ]);
+
+  useEffect(() => {
+    if (!meta || metaStatus !== "ready" || !projectOn3d || !showSeaIce) {
+      setSeaIceStatus("off");
+      setSeaIceError(null);
+      setSeaIceValues(null);
+      return;
+    }
+
+    let cancelled = false;
+    setSeaIceStatus("loading");
+    setSeaIceError(null);
+    loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex: safeTimeIdx })
+      .then((values) => {
+        if (cancelled) return;
+        setSeaIceValues(values);
+        setSeaIceStatus("ready");
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        console.error(e);
+        setSeaIceValues(null);
+        setSeaIceStatus("failed");
+        setSeaIceError(e instanceof Error ? e.message : String(e));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [meta, metaStatus, projectOn3d, safeTimeIdx, showSeaIce]);
+
+  useEffect(() => {
+    if (!meta || metaStatus !== "ready" || !projectOn3d || !playing) return;
+    if (!timeList.length) return;
+    const ahead = 3;
+    const yIndex = viewMode === "transect" ? nearestIndex(meta.lat, latTarget) : -1;
+    for (let step = 1; step <= ahead; step++) {
+      const tIndex = (safeTimeIdx + step) % timeList.length;
+      if (viewMode === "horizontal") {
+        void loadHorizontalSlice({
+          storeUrl: meta.storeUrl,
+          varId,
+          tIndex,
+          zIndex: safeDepthIdx,
+          nLat: meta.lat.length,
+          nLon: meta.lon.length,
+        }).catch(() => undefined);
+      } else {
+        void loadTransectSlice({
+          storeUrl: meta.storeUrl,
+          varId,
+          tIndex,
+          yIndex,
+        }).catch(() => undefined);
+      }
+      if (showSeaIce) {
+        void loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex }).catch(() => undefined);
+      }
+    }
+  }, [
+    latTarget,
+    meta,
+    metaStatus,
+    playing,
+    projectOn3d,
+    safeDepthIdx,
+    safeTimeIdx,
     showSeaIce,
+    timeList.length,
+    varId,
+    viewMode,
   ]);
 
   const horizontalField = useMemo(() => {
@@ -295,11 +420,16 @@ export default function App() {
       cmax: settings.cmax,
       colorscale,
       opacity: overlayOpacity,
-      mode: projectionMode,
+      mode: "surface" as const,
       zPlane: meta.z?.[safeDepthIdx] ?? 0,
       showScale: showColorbar,
       colorbarTitle: range.title,
       colorbarTicks,
+      colorbarLen: mainColorbarLayout.len,
+      colorbarX: mainColorbarLayout.x,
+      colorbarY: mainColorbarLayout.y,
+      zeroAsMissing: varId === "S",
+      maskDryByBathy: true,
     };
   }, [
     colorscale,
@@ -307,7 +437,6 @@ export default function App() {
     meta,
     overlayOpacity,
     projectOn3d,
-    projectionMode,
     safeDepthIdx,
     showColorbar,
     colorbarTicks,
@@ -315,6 +444,10 @@ export default function App() {
     settings.cmax,
     settings.cmin,
     viewMode,
+    mainColorbarLayout.len,
+    mainColorbarLayout.x,
+    mainColorbarLayout.y,
+    varId,
   ]);
 
   const transectField = useMemo(() => {
@@ -332,6 +465,9 @@ export default function App() {
       showScale: showColorbar,
       colorbarTitle: range.title,
       colorbarTicks,
+      colorbarLen: mainColorbarLayout.len,
+      colorbarX: mainColorbarLayout.x,
+      colorbarY: mainColorbarLayout.y,
     };
   }, [
     colorscale,
@@ -347,78 +483,75 @@ export default function App() {
     transectLatActual,
     transectValues,
     viewMode,
+    mainColorbarLayout.len,
+    mainColorbarLayout.x,
+    mainColorbarLayout.y,
+  ]);
+
+  const seaIcePlane = useMemo(() => {
+    if (!meta || !projectOn3d || !showSeaIce || !seaIceValues) return null;
+    const masked = seaIceValues.map((row) =>
+      row.map((v) => {
+        const x = Number(v);
+        if (!Number.isFinite(x)) return Number.NaN;
+        if (x <= seaIceMin) return Number.NaN;
+        return Math.max(0, Math.min(1, x));
+      })
+    );
+    const cmin = Math.max(0, Math.min(0.99, seaIceMin));
+    return {
+      enabled: true,
+      values: masked,
+      lon: meta.lon,
+      lat: meta.lat,
+      cmin,
+      cmax: 1,
+      colorscale: paletteToColorscale(ice_256()),
+      opacity: seaIceOpacity,
+      mode: "surface" as const,
+      zPlane: seaIceHeightM,
+      showScale: showSeaIceColorbar,
+      colorbarTitle: `Sea ice (${cmin.toFixed(2)}–1)`,
+      colorbarTicks: [cmin, 0.5, 0.75, 1].filter((v, i, arr) => arr.indexOf(v) === i),
+      colorbarLen: seaIceColorbarLayout.len,
+      colorbarX: seaIceColorbarLayout.x,
+      colorbarY: seaIceColorbarLayout.y,
+    };
+  }, [
+    meta,
+    projectOn3d,
+    seaIceHeightM,
+    seaIceMin,
+    seaIceOpacity,
+    seaIceValues,
+    seaIceColorbarLayout.len,
+    seaIceColorbarLayout.x,
+    seaIceColorbarLayout.y,
+    showSeaIce,
+    showSeaIceColorbar,
   ]);
 
   const horizontalPlanes = useMemo(() => {
-    if (!meta || !projectOn3d || viewMode !== "water3d" || sliceStatus !== "ready" || !field3d) return undefined;
-    const nz = meta.z.length;
-    if (!nz) return undefined;
-    const n = Math.max(2, Math.min(stackSlices, nz));
-    const indices: number[] = [];
-    for (let i = 0; i < n; i++) {
-      const t = n === 1 ? 0 : i / (n - 1);
-      indices.push(Math.round(t * (nz - 1)));
-    }
-    const planes = indices.map((k, i) => {
-      const values2d = slice3DTo2D({ data: field3d.data, nz: field3d.nz, ny: field3d.ny, nx: field3d.nx, k });
-      const showScaleThis = Boolean(showColorbar) && i === indices.length - 1;
-      return {
-        enabled: true,
-        values: values2d,
-        lon: meta.lon,
-        lat: meta.lat,
-        cmin: settings.cmin,
-        cmax: settings.cmax,
-        colorscale,
-        opacity: stackOpacity,
-        mode: "surface" as const,
-        zPlane: meta.z[k] ?? 0,
-        showScale: showScaleThis,
-        colorbarTitle: range.title,
-        colorbarTicks,
-      };
-    });
-
-    if (showSeaIce && seaIceValues) {
-      planes.push({
-        enabled: true,
-        values: seaIceValues,
-        lon: meta.lon,
-        lat: meta.lat,
-        cmin: 0,
-        cmax: 1,
-        colorscale: paletteToColorscale(blues_r_256()),
-        opacity: seaIceOpacity,
-        mode: "surface" as const,
-        zPlane: 0,
-        showScale: false,
-        colorbarTitle: "Sea ice (0–1)",
-      });
-    }
-
-    return planes;
+    if (!meta || !projectOn3d) return undefined;
+    return seaIcePlane ? [seaIcePlane] : undefined;
   }, [
-    colorbarTicks,
-    colorscale,
-    field3d,
     meta,
     projectOn3d,
-    range.title,
-    seaIceOpacity,
-    seaIceValues,
-    settings.cmax,
-    settings.cmin,
-    showColorbar,
-    showSeaIce,
-    sliceStatus,
-    stackOpacity,
-    stackSlices,
-    viewMode,
+    seaIcePlane,
   ]);
 
   const resetColorScale = useCallback(() => {
     setColorSettings((prev) => ({ ...prev, [varId]: DEFAULT_COLOR_SETTINGS[varId] }));
   }, [varId]);
+
+  const resetCamera = useCallback(() => {
+    try {
+      window.localStorage.removeItem("gs_scene_camera_v1");
+    } catch {
+      // ignore
+    }
+    setCameraResetNonce((n) => n + 1);
+  }, []);
 
   const autoColorScaleFromFrame = useCallback(() => {
     const values = viewMode === "horizontal" ? horizontalValues : transectValues;
@@ -438,418 +571,600 @@ export default function App() {
   return (
     <div className="app">
       <Basemap3D
+        bathySource={bathySource}
+        cameraResetNonce={cameraResetNonce}
+        depthRatio={depthRatio}
+        depthWarp={{ mode: depthWarpMode, focusDepthM: depthFocusM, deepRatio }}
+        showBathy={viewMode === "transect" ? showBathyInTransect : true}
         onStatusChange={handleStatusChange}
         showBathyContours={showBathyContours}
+        showFieldContours={showFieldContours}
         horizontalField={horizontalField}
         horizontalPlanes={horizontalPlanes}
         transectField={transectField}
       />
 
       <div className="overlay">
-        <div className="panel sidebar">
-          <div className="title">
-            <div>
-              <h1>Greenland Sea</h1>
-              <div className="sub">Zarr-driven T/S visualization</div>
-            </div>
-            <div className="badge">Local</div>
-          </div>
-
-          <div className="controls">
-            <div className="tabs">
-              <button
-                className={`tab ${viewMode === "water3d" ? "tabActive" : ""}`}
-                onClick={() => setViewMode("water3d")}
-              >
-                3D Water
-              </button>
-              <button
-                className={`tab ${viewMode === "horizontal" ? "tabActive" : ""}`}
-                onClick={() => setViewMode("horizontal")}
-              >
-                Horizontal
-              </button>
-              <button
-                className={`tab ${viewMode === "transect" ? "tabActive" : ""}`}
-                onClick={() => setViewMode("transect")}
-              >
-                Transect
-              </button>
-            </div>
-
-            <label>
-              Variable
-              <select value={varId} onChange={(e) => setVarId(e.target.value as VarId)}>
-                {meta?.variables?.map((v) => (
-                  <option key={v.id} value={v.id} disabled={!v.available}>
-                    {v.label}
-                    {!v.available ? " (missing in GS.zarr)" : ""}
-                  </option>
-                )) ?? (
-                  <>
-                    <option value="T">Temperature (T)</option>
-                    <option value="S">Salinity (S)</option>
-                  </>
-                )}
-              </select>
-            </label>
-
+        {!panelOpen ? (
+          <button
+            type="button"
+            className="panelOpenButton"
+            title="Open control panel"
+            onClick={() => setPanelOpen(true)}
+          >
+            ☰
+          </button>
+        ) : (
+          <div
+            ref={panelRef}
+            className="panel controlPanel"
+            style={{
+              left: panelPos?.left ?? 16,
+              ...(panelPos ? { top: panelPos.top } : { bottom: 16 }),
+            }}
+          >
             <div
-              style={{
-                border: "1px solid rgba(255,255,255,0.08)",
-                borderRadius: 12,
-                padding: "10px 10px",
-                background: "rgba(255,255,255,0.02)",
-                display: "grid",
-                gap: 10,
+              className="panelHeader"
+              title="Drag to move (double-click to reset)"
+              onDoubleClick={() => setPanelPos(null)}
+              onPointerDown={(e) => {
+                if ((e.target as HTMLElement | null)?.closest?.("button")) return;
+                const el = panelRef.current;
+                if (!el) return;
+                const rect = el.getBoundingClientRect();
+                const startOffsetX = e.clientX - rect.left;
+                const startOffsetY = e.clientY - rect.top;
+
+                const onMove = (ev: PointerEvent) => {
+                  const el2 = panelRef.current;
+                  if (!el2) return;
+                  const rect2 = el2.getBoundingClientRect();
+                  const nextLeft = ev.clientX - startOffsetX;
+                  const nextTop = ev.clientY - startOffsetY;
+                  const maxLeft = Math.max(12, window.innerWidth - rect2.width - 12);
+                  const maxTop = Math.max(12, window.innerHeight - rect2.height - 12);
+                  setPanelPos({
+                    left: clamp(nextLeft, 12, maxLeft),
+                    top: clamp(nextTop, 12, maxTop),
+                  });
+                };
+
+                const onUp = () => {
+                  window.removeEventListener("pointermove", onMove);
+                  window.removeEventListener("pointerup", onUp);
+                  window.removeEventListener("pointercancel", onUp);
+                };
+
+                window.addEventListener("pointermove", onMove);
+                window.addEventListener("pointerup", onUp);
+                window.addEventListener("pointercancel", onUp);
               }}
             >
-              <div style={{ fontSize: 12, fontWeight: 700, color: "rgba(255,255,255,0.78)" }}>
-                Color scale
-              </div>
-
-              <div style={{ display: "flex", gap: 10 }}>
-                <label style={{ flex: 1 }}>
-                  Min
-                  <input
-                    type="number"
-                    value={settings.cmin}
-                    step={0.1}
-                    onChange={(e) =>
-                      setColorSettings((prev) => ({
-                        ...prev,
-                        [varId]: {
-                          ...prev[varId],
-                          cmin:
-                            e.target.value === "" ? prev[varId].cmin : Number(e.target.value),
-                        },
-                      }))
-                    }
-                  />
-                </label>
-                <label style={{ flex: 1 }}>
-                  Max
-                  <input
-                    type="number"
-                    value={settings.cmax}
-                    step={0.1}
-                    onChange={(e) =>
-                      setColorSettings((prev) => ({
-                        ...prev,
-                        [varId]: {
-                          ...prev[varId],
-                          cmax:
-                            e.target.value === "" ? prev[varId].cmax : Number(e.target.value),
-                        },
-                      }))
-                    }
-                  />
-                </label>
-              </div>
-
-              <div style={{ display: "flex", gap: 10 }}>
-                <button type="button" className="tab" onClick={resetColorScale} style={{ flex: 1 }}>
-                  Reset default
-                </button>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>Control Panel</div>
                 <button
                   type="button"
-                  className="tab"
-                  onClick={autoColorScaleFromFrame}
-                  style={{ flex: 1 }}
-                  disabled={sliceStatus !== "ready"}
-                  title={sliceStatus !== "ready" ? "Load a slice first" : "Auto range from current frame"}
+                  className="panelIconButton"
+                  title="Reset 3D view"
+                  onClick={resetCamera}
                 >
-                  Auto (frame)
+                  ⟲
                 </button>
               </div>
-
-              <div style={{ display: "flex", gap: 10 }}>
-                <label style={{ flex: 1 }}>
-                  Ticks
-                  <select
-                    value={String(settings.tickCount)}
-                    onChange={(e) =>
-                      setColorSettings((prev) => ({
-                        ...prev,
-                        [varId]: { ...prev[varId], tickCount: Number(e.target.value) },
-                      }))
-                    }
-                  >
-                    <option value="0">Auto</option>
-                    <option value="5">5</option>
-                    <option value="7">7</option>
-                    <option value="9">9</option>
-                    <option value="11">11</option>
-                  </select>
-                </label>
-
-                <label style={{ flex: 1 }}>
-                  Mode
-                  <select
-                    value={settings.mode}
-                    onChange={(e) =>
-                      setColorSettings((prev) => ({
-                        ...prev,
-                        [varId]: { ...prev[varId], mode: e.target.value as ColorscaleMode },
-                      }))
-                    }
-                  >
-                    <option value="continuous">Continuous</option>
-                    <option value="discrete">Discrete</option>
-                  </select>
-                </label>
-              </div>
-
-              {settings.mode === "discrete" ? (
-                <label>
-                  Levels
-                  <select
-                    value={String(settings.levels)}
-                    onChange={(e) =>
-                      setColorSettings((prev) => ({
-                        ...prev,
-                        [varId]: { ...prev[varId], levels: Number(e.target.value) },
-                      }))
-                    }
-                  >
-                    <option value="8">8</option>
-                    <option value="12">12</option>
-                    <option value="16">16</option>
-                    <option value="24">24</option>
-                    <option value="32">32</option>
-                  </select>
-                </label>
-              ) : null}
-
-              <div className="hint">
-                Default: <b>[{DEFAULT_COLOR_SETTINGS[varId].cmin}, {DEFAULT_COLOR_SETTINGS[varId].cmax}]</b>
+              <div className="panelHeaderRight">
+                <div className="badge">Local</div>
+                <button
+                  type="button"
+                  className="panelIconButton"
+                  title="Close"
+                  onClick={() => setPanelOpen(false)}
+                >
+                  ✕
+                </button>
               </div>
             </div>
 
-            {viewMode === "water3d" ? (
-              <>
-                <label>
-                  3D stack slices (count)
-                  <select value={String(stackSlices)} onChange={(e) => setStackSlices(Number(e.target.value))}>
-                    <option value="6">6</option>
-                    <option value="8">8</option>
-                    <option value="10">10</option>
-                    <option value="12">12</option>
-                    <option value="16">16</option>
-                  </select>
-                </label>
-                <label>
-                  Stack opacity
-                  <select value={String(stackOpacity)} onChange={(e) => setStackOpacity(Number(e.target.value))}>
-                    <option value="0.08">0.08</option>
-                    <option value="0.12">0.12</option>
-                    <option value="0.14">0.14</option>
-                    <option value="0.18">0.18</option>
-                    <option value="0.22">0.22</option>
-                  </select>
-                </label>
-                <label>
-                  Sea ice (SIarea)
-                  <select value={showSeaIce ? "on" : "off"} onChange={(e) => setShowSeaIce(e.target.value === "on")}>
-                    <option value="on">On</option>
-                    <option value="off">Off</option>
-                  </select>
-                </label>
-                {showSeaIce ? (
-                  <label>
-                    Sea ice opacity
-                    <select
-                      value={String(seaIceOpacity)}
-                      onChange={(e) => setSeaIceOpacity(Number(e.target.value))}
+            <div className="title" style={{ marginBottom: 0 }}>
+              <div>
+                <h1>Greenland Sea</h1>
+                <div className="sub">T/S + sea ice over 3D bathymetry</div>
+              </div>
+            </div>
+
+            <div className="controls">
+              <details className="section" open>
+                <summary>View</summary>
+                <div className="sectionBody">
+                  <div className="tabs">
+                    <button
+                      className={`tab ${viewMode === "horizontal" ? "tabActive" : ""}`}
+                      onClick={() => setViewMode("horizontal")}
                     >
-                      <option value="0.35">0.35</option>
-                      <option value="0.45">0.45</option>
-                      <option value="0.55">0.55</option>
-                      <option value="0.65">0.65</option>
-                      <option value="0.75">0.75</option>
+                      Horizontal
+                    </button>
+                    <button
+                      className={`tab ${viewMode === "transect" ? "tabActive" : ""}`}
+                      onClick={() => setViewMode("transect")}
+                    >
+                      Transect
+                    </button>
+                  </div>
+
+                  <label>
+                    Variable
+                    <select value={varId} onChange={(e) => setVarId(e.target.value as VarId)}>
+                      {meta?.variables?.map((v) => (
+                        <option key={v.id} value={v.id} disabled={!v.available}>
+                          {v.label}
+                          {!v.available ? " (missing in GS.zarr)" : ""}
+                        </option>
+                      )) ?? (
+                        <>
+                          <option value="T">Temperature (T)</option>
+                          <option value="S">Salinity (S)</option>
+                        </>
+                      )}
                     </select>
                   </label>
-                ) : null}
-              </>
-            ) : viewMode === "horizontal" ? (
-              <label>
-                Depth ({activeDepthLabel})
-                <input
-                  type="range"
-                  min={0}
-                  max={Math.max(0, zList.length - 1)}
-                  value={safeDepthIdx}
-                  onChange={(e) => setDepthIdx(Number(e.target.value))}
-                  style={{ width: "100%" }}
-                  disabled={metaStatus !== "ready" || !zList.length}
-                />
-                {zList.length ? (
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      fontSize: 11,
-                      color: "rgba(255,255,255,0.62)",
-                      marginTop: 4,
-                    }}
-                  >
-                    <span>{Math.round(zList[0])} m</span>
-                    <span>{Math.round(zList[zList.length - 1])} m</span>
+
+                  <label>
+                    Overlay opacity
+                    <select
+                      value={String(overlayOpacity)}
+                      onChange={(e) => setOverlayOpacity(Number(e.target.value))}
+                      disabled={!projectOn3d}
+                    >
+                      <option value="0.65">0.65</option>
+                      <option value="0.75">0.75</option>
+                      <option value="0.85">0.85</option>
+                      <option value="0.9">0.90</option>
+                      <option value="0.95">0.95</option>
+                      <option value="1">1.00</option>
+                    </select>
+                  </label>
+
+                  <div className="toggleRow">
+                    <div>Colorbar</div>
+                    <ToggleSwitch checked={showColorbar} onCheckedChange={setShowColorbar} />
                   </div>
-                ) : null}
-              </label>
-            ) : (
-              <label>
-                Latitude target (°N)
-                <input
-                  type="number"
-                  value={latTarget}
-                  min={latMin}
-                  max={latMax}
-                  step={0.1}
-                  onChange={(e) => setLatTarget(Number(e.target.value))}
-                  disabled={metaStatus !== "ready"}
-                />
-                {transectLatActual != null ? (
-                  <div className="hint">Nearest model latitude: {transectLatActual.toFixed(3)}°N</div>
-                ) : null}
-              </label>
-            )}
-
-            <label>
-              Time ({activeTimeLabel})
-              <input
-                type="range"
-                min={0}
-                max={Math.max(0, timeList.length - 1)}
-                value={safeTimeIdx}
-                onChange={(e) => setTimeIdx(Number(e.target.value))}
-                style={{ width: "100%" }}
-                disabled={metaStatus !== "ready" || !timeList.length}
-              />
-              {timeList.length ? (
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    fontSize: 11,
-                    color: "rgba(255,255,255,0.62)",
-                    marginTop: 4,
-                  }}
-                >
-                  <span>{timeList[0]}</span>
-                  <span>{timeList[timeList.length - 1]}</span>
+                  <div className="toggleRow">
+                    <div>Field contours</div>
+                    <ToggleSwitch checked={showFieldContours} onCheckedChange={setShowFieldContours} />
+                  </div>
                 </div>
-              ) : null}
-            </label>
+              </details>
 
-            <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
-              <label style={{ flex: 1 }}>
-                Animation
-                <button
-                  type="button"
-                  className="tab tabActive"
-                  onClick={() => setPlaying((p) => !p)}
-                  style={{ width: "100%" }}
-                  disabled={metaStatus !== "ready" || !timeList.length}
-                >
-                  {playing ? "Pause" : "Play"}
-                </button>
-              </label>
+              <details className="section" open>
+                <summary>Slice</summary>
+                <div className="sectionBody">
+                  {viewMode === "horizontal" ? (
+                    <label>
+                      Depth ({activeDepthLabel})
+                      <input
+                        type="range"
+                        min={0}
+                        max={Math.max(0, zList.length - 1)}
+                        value={safeDepthIdx}
+                        onChange={(e) => setDepthIdx(Number(e.target.value))}
+                        style={{ width: "100%" }}
+                        disabled={metaStatus !== "ready" || !zList.length}
+                      />
+                      {zList.length ? (
+                        <div
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            fontSize: 11,
+                            color: "rgba(255,255,255,0.62)",
+                            marginTop: 4,
+                          }}
+                        >
+                          <span>{Math.round(zList[0])} m</span>
+                          <span>{Math.round(zList[zList.length - 1])} m</span>
+                        </div>
+                      ) : null}
+                    </label>
+                  ) : (
+                    <label>
+                      Latitude target (°N) ({latTarget.toFixed(2)}°N)
+                      <input
+                        type="range"
+                        min={latMin}
+                        max={latMax}
+                        step={0.01}
+                        value={latTarget}
+                        onChange={(e) => setLatTarget(Number(e.target.value))}
+                        style={{ width: "100%" }}
+                        disabled={metaStatus !== "ready"}
+                      />
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          fontSize: 11,
+                          color: "rgba(255,255,255,0.62)",
+                          marginTop: 4,
+                        }}
+                      >
+                        <span>{latMin.toFixed(1)}°N</span>
+                        <span>{latMax.toFixed(1)}°N</span>
+                      </div>
+                      <div style={{ marginTop: 8 }}>
+                        <input
+                          type="number"
+                          value={latTarget}
+                          min={latMin}
+                          max={latMax}
+                          step={0.05}
+                          onChange={(e) => setLatTarget(Number(e.target.value))}
+                          disabled={metaStatus !== "ready"}
+                        />
+                      </div>
+                      {transectLatActual != null ? (
+                        <div className="hint">Nearest model latitude: {transectLatActual.toFixed(3)}°N</div>
+                      ) : null}
+                    </label>
+                  )}
 
-              <label style={{ width: 120 }}>
-                FPS
-                <select value={String(fps)} onChange={(e) => setFps(Number(e.target.value))}>
-                  <option value="1">1</option>
-                  <option value="2">2</option>
-                  <option value="3">3</option>
-                  <option value="4">4</option>
-                </select>
-              </label>
-            </div>
+                  <label>
+                    Depth ratio (z) ({depthRatio.toFixed(2)})
+                    <input
+                      type="range"
+                      min={0.15}
+                      max={1.5}
+                      step={0.05}
+                      value={depthRatio}
+                      onChange={(e) => setDepthRatio(Number(e.target.value))}
+                      style={{ width: "100%" }}
+                    />
+                    <div className="hint">Vertical exaggeration.</div>
+                  </label>
 
-            <label>
-              3D overlay
-              <select
-                value={projectOn3d ? "on" : "off"}
-                onChange={(e) => setProjectOn3d(e.target.value === "on")}
-              >
-                <option value="on">On</option>
-                <option value="off">Off (bathymetry only)</option>
-              </select>
-            </label>
+                  <label>
+                    Depth scaling
+                    <select value={depthWarpMode} onChange={(e) => setDepthWarpMode(e.target.value as any)}>
+                      <option value="upper">Upper-focus (e.g., top 2500 m)</option>
+                      <option value="linear">Linear</option>
+                    </select>
+                  </label>
 
-            {viewMode === "horizontal" ? (
-              <label>
-                Projection mode
-                <select
-                  value={projectionMode}
-                  onChange={(e) => setProjectionMode(e.target.value as ProjectionMode)}
-                  disabled={!projectOn3d}
-                >
-                  <option value="bathy">Texture on bathymetry</option>
-                  <option value="surface">Plane at selected depth</option>
-                </select>
-              </label>
-            ) : null}
+                  {depthWarpMode === "upper" ? (
+                    <>
+                      <label>
+                        Focus depth (m) ({Math.round(depthFocusM)} m)
+                        <input
+                          type="range"
+                          min={500}
+                          max={6000}
+                          step={100}
+                          value={depthFocusM}
+                          onChange={(e) => setDepthFocusM(Number(e.target.value))}
+                          style={{ width: "100%" }}
+                        />
+                        <div className="hint">Upper layer stays linear; deeper layers are compressed.</div>
+                      </label>
+                      <label>
+                        Deep ratio ({deepRatio.toFixed(2)})
+                        <input
+                          type="range"
+                          min={0.05}
+                          max={1}
+                          step={0.05}
+                          value={deepRatio}
+                          onChange={(e) => setDeepRatio(Number(e.target.value))}
+                          style={{ width: "100%" }}
+                        />
+                        <div className="hint">Lower compresses deep ocean (below focus depth).</div>
+                      </label>
+                    </>
+                  ) : null}
 
-            <label>
-              Overlay opacity
-              <select
-                value={String(overlayOpacity)}
-                onChange={(e) => setOverlayOpacity(Number(e.target.value))}
-                disabled={!projectOn3d}
-              >
-                <option value="0.65">0.65</option>
-                <option value="0.75">0.75</option>
-                <option value="0.85">0.85</option>
-                <option value="0.9">0.90</option>
-                <option value="0.95">0.95</option>
-                <option value="1">1.00</option>
-              </select>
-            </label>
+                  {viewMode === "transect" ? (
+                    <button
+                      type="button"
+                      className={`tab ${showBathyInTransect ? "tabActive" : ""}`}
+                      onClick={() => setShowBathyInTransect((v) => !v)}
+                      style={{ width: "100%" }}
+                    >
+                      Transect bathymetry {showBathyInTransect ? "On" : "Off"}
+                    </button>
+                  ) : null}
+                </div>
+              </details>
 
-            <label>
-              Colorbar
-              <select
-                value={showColorbar ? "show" : "hide"}
-                onChange={(e) => setShowColorbar(e.target.value === "show")}
-              >
-                <option value="show">Show</option>
-                <option value="hide">Hide</option>
-              </select>
-            </label>
+              <details className="section" open>
+                <summary>Time</summary>
+                <div className="sectionBody">
+                  <label>
+                    Time ({activeTimeLabel})
+                    <input
+                      type="range"
+                      min={0}
+                      max={Math.max(0, timeList.length - 1)}
+                      value={safeTimeIdx}
+                      onChange={(e) => setTimeIdx(Number(e.target.value))}
+                      style={{ width: "100%" }}
+                      disabled={metaStatus !== "ready" || !timeList.length}
+                    />
+                    {timeList.length ? (
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          fontSize: 11,
+                          color: "rgba(255,255,255,0.62)",
+                          marginTop: 4,
+                        }}
+                      >
+                        <span>{timeList[0]}</span>
+                        <span>{timeList[timeList.length - 1]}</span>
+                      </div>
+                    ) : null}
+                  </label>
 
-            <label>
-              Bathymetry contours
-              <select
-                value={showBathyContours ? "on" : "off"}
-                onChange={(e) => setShowBathyContours(e.target.value === "on")}
-              >
-                <option value="off">Off</option>
-                <option value="on">On</option>
-              </select>
-            </label>
+                  <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
+                    <label style={{ flex: 1 }}>
+                      Animation
+                      <button
+                        type="button"
+                        className="tab tabActive"
+                        onClick={() => setPlaying((p) => !p)}
+                        style={{ width: "100%" }}
+                        disabled={metaStatus !== "ready" || !timeList.length}
+                      >
+                        {playing ? "Pause" : "Play"}
+                      </button>
+                    </label>
 
-            <div className="hint">
-              Dataset: <b>public/data/GS.zarr</b> — meta <b>{metaStatus}</b>
-              {metaStatus === "failed" && metaError ? (
-                <div style={{ marginTop: 6 }}>Error: {metaError}</div>
-              ) : null}
-            </div>
+                    <label style={{ width: 120 }}>
+                      FPS
+                      <select value={String(fps)} onChange={(e) => setFps(Number(e.target.value))}>
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3">3</option>
+                        <option value="4">4</option>
+                      </select>
+                    </label>
+                  </div>
+                </div>
+              </details>
 
-            <div className="hint">
-              Slice: <b>{sliceStatus}</b>
-              {sliceStatus === "failed" && sliceError ? (
-                <div style={{ marginTop: 6 }}>Error: {sliceError}</div>
-              ) : null}
-            </div>
+              <details className="section">
+                <summary>Color scale</summary>
+                <div className="sectionBody">
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <label style={{ flex: 1 }}>
+                      Min
+                      <input
+                        type="number"
+                        value={settings.cmin}
+                        step={0.1}
+                        onChange={(e) =>
+                          setColorSettings((prev) => ({
+                            ...prev,
+                            [varId]: {
+                              ...prev[varId],
+                              cmin: e.target.value === "" ? prev[varId].cmin : Number(e.target.value),
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                    <label style={{ flex: 1 }}>
+                      Max
+                      <input
+                        type="number"
+                        value={settings.cmax}
+                        step={0.1}
+                        onChange={(e) =>
+                          setColorSettings((prev) => ({
+                            ...prev,
+                            [varId]: {
+                              ...prev[varId],
+                              cmax: e.target.value === "" ? prev[varId].cmax : Number(e.target.value),
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
 
-            <div className="hint">
-              3D: Plotly <b>{bathyInfo.plotly}</b>, bathymetry <b>{bathyInfo.bathy}</b>.
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <button type="button" className="tab" onClick={resetColorScale} style={{ flex: 1 }}>
+                      Reset default
+                    </button>
+                    <button
+                      type="button"
+                      className="tab"
+                      onClick={autoColorScaleFromFrame}
+                      style={{ flex: 1 }}
+                      disabled={sliceStatus !== "ready"}
+                      title={sliceStatus !== "ready" ? "Load a slice first" : "Auto range from current frame"}
+                    >
+                      Auto (frame)
+                    </button>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <label style={{ flex: 1 }}>
+                      Ticks
+                      <select
+                        value={String(settings.tickCount)}
+                        onChange={(e) =>
+                          setColorSettings((prev) => ({
+                            ...prev,
+                            [varId]: { ...prev[varId], tickCount: Number(e.target.value) },
+                          }))
+                        }
+                      >
+                        <option value="0">Auto</option>
+                        <option value="5">5</option>
+                        <option value="7">7</option>
+                        <option value="9">9</option>
+                        <option value="11">11</option>
+                      </select>
+                    </label>
+
+                    <label style={{ flex: 1 }}>
+                      Mode
+                      <select
+                        value={settings.mode}
+                        onChange={(e) =>
+                          setColorSettings((prev) => ({
+                            ...prev,
+                            [varId]: { ...prev[varId], mode: e.target.value as ColorscaleMode },
+                          }))
+                        }
+                      >
+                        <option value="continuous">Continuous</option>
+                        <option value="discrete">Discrete</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  {settings.mode === "discrete" ? (
+                    <label>
+                      Levels
+                      <select
+                        value={String(settings.levels)}
+                        onChange={(e) =>
+                          setColorSettings((prev) => ({
+                            ...prev,
+                            [varId]: { ...prev[varId], levels: Number(e.target.value) },
+                          }))
+                        }
+                      >
+                        <option value="8">8</option>
+                        <option value="12">12</option>
+                        <option value="16">16</option>
+                        <option value="24">24</option>
+                        <option value="32">32</option>
+                      </select>
+                    </label>
+                  ) : null}
+
+                  <div className="hint">
+                    Default: <b>[{DEFAULT_COLOR_SETTINGS[varId].cmin}, {DEFAULT_COLOR_SETTINGS[varId].cmax}]</b>
+                  </div>
+                </div>
+              </details>
+
+              <details className="section">
+                <summary>Overlays</summary>
+                <div className="sectionBody">
+                  <button
+                    type="button"
+                    className={`tab ${showSeaIce ? "tabActive" : ""}`}
+                    onClick={() => setShowSeaIce((v) => !v)}
+                    title="Sea ice concentration (SIarea)"
+                    style={{ width: "100%" }}
+                  >
+                    Sea ice {showSeaIce ? "On" : "Off"}
+                  </button>
+
+                  {showSeaIce ? (
+                    <label>
+                      Sea ice opacity
+                      <select
+                        value={String(seaIceOpacity)}
+                        onChange={(e) => setSeaIceOpacity(Number(e.target.value))}
+                        disabled={!projectOn3d}
+                      >
+                        <option value="0.25">0.25</option>
+                        <option value="0.35">0.35</option>
+                        <option value="0.45">0.45</option>
+                        <option value="0.55">0.55</option>
+                        <option value="0.65">0.65</option>
+                        <option value="0.75">0.75</option>
+                      </select>
+                      <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+                        <label style={{ flex: 1 }}>
+                          Sea ice threshold
+                          <select value={String(seaIceMin)} onChange={(e) => setSeaIceMin(Number(e.target.value))}>
+                            <option value="0">0.00</option>
+                            <option value="0.02">0.02</option>
+                            <option value="0.05">0.05</option>
+                            <option value="0.1">0.10</option>
+                            <option value="0.15">0.15</option>
+                            <option value="0.2">0.20</option>
+                            <option value="0.25">0.25</option>
+                            <option value="0.3">0.30</option>
+                            <option value="0.35">0.35</option>
+                          </select>
+                          <div className="hint">Colorbar range matches threshold.</div>
+                        </label>
+                        <label style={{ flex: 1 }}>
+                          Height (m)
+                          <select value={String(seaIceHeightM)} onChange={(e) => setSeaIceHeightM(Number(e.target.value))}>
+                            <option value="0">0</option>
+                            <option value="1">1</option>
+                            <option value="2">2</option>
+                            <option value="5">5</option>
+                            <option value="10">10</option>
+                            <option value="20">20</option>
+                          </select>
+                        </label>
+                        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
+                          <div style={{ fontSize: 12, opacity: 0.75 }}>Colorbar</div>
+                          <button
+                            type="button"
+                            className={`tab ${showSeaIceColorbar ? "tabActive" : ""}`}
+                            onClick={() => setShowSeaIceColorbar((v) => !v)}
+                            disabled={!projectOn3d}
+                          >
+                            {showSeaIceColorbar ? "On" : "Off"}
+                          </button>
+                        </div>
+                      </div>
+                      <div className="hint">Status: {seaIceStatus}{seaIceError ? ` — ${seaIceError}` : ""}</div>
+                    </label>
+                  ) : (
+                    <div className="hint">Sea ice is a 2D overlay at z=0 (surface).</div>
+                  )}
+                </div>
+              </details>
+
+              <details className="section">
+                <summary>Bathymetry</summary>
+                <div className="sectionBody">
+                  <div className="toggleRow">
+                    <div>Bathy contours</div>
+                    <ToggleSwitch checked={showBathyContours} onCheckedChange={setShowBathyContours} />
+                  </div>
+                  <label>
+                    Bathymetry source
+                    <select value={bathySource} onChange={(e) => setBathySource(e.target.value as any)}>
+                      <option value="auto">Auto (prefer RTopo downsampled)</option>
+                      <option value="bathy">bathy.json</option>
+                      <option value="rtopo_ds">bathy_RTopo_ds.json</option>
+                      <option value="rtopo">bathy_RTopo.json (slow)</option>
+                    </select>
+                  </label>
+                </div>
+              </details>
+
+              <details className="section">
+                <summary>Status</summary>
+                <div className="sectionBody">
+                  <div className="hint">
+                    Dataset: <b>{meta?.storeUrl ? meta.storeUrl.split("/").slice(-1)[0] : "public/data/GS_web.zarr"}</b> — meta{" "}
+                    <b>{metaStatus}</b>
+                    {metaStatus === "failed" && metaError ? <div style={{ marginTop: 6 }}>Error: {metaError}</div> : null}
+                  </div>
+
+                  <div className="hint">
+                    Slice: <b>{sliceStatus}</b>
+                    {sliceStatus === "failed" && sliceError ? <div style={{ marginTop: 6 }}>Error: {sliceError}</div> : null}
+                  </div>
+
+                  <div className="hint">
+                    3D: Plotly <b>{bathyInfo.plotly}</b>, bathymetry <b>{bathyInfo.bathy}</b>.
+                  </div>
+                </div>
+              </details>
             </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

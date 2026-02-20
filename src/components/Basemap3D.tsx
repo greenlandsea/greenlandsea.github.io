@@ -56,7 +56,14 @@ type HorizontalField = {
   showScale?: boolean;
   colorbarTitle?: string;
   colorbarTicks?: number[];
+  colorbarLen?: number;
+  colorbarX?: number;
+  colorbarY?: number;
   bounds?: LonLatBounds;
+  // Treat exact zero as missing (useful for some salinity exports with 0 fill over land).
+  zeroAsMissing?: boolean;
+  // Mask cells where nearest bathymetry is dry/land (depth near sea level).
+  maskDryByBathy?: boolean;
 };
 
 type TransectField = {
@@ -72,23 +79,36 @@ type TransectField = {
   showScale?: boolean;
   colorbarTitle?: string;
   colorbarTicks?: number[];
+  colorbarLen?: number;
+  colorbarX?: number;
+  colorbarY?: number;
 };
 
-async function tryLoadBathyJson(): Promise<BathyGrid | null> {
+async function tryLoadBathyJson(
+  bathySource?: "auto" | "bathy" | "rtopo_ds" | "rtopo"
+): Promise<BathyGrid | null> {
   try {
     const forceFull =
       typeof window !== "undefined" &&
       new URLSearchParams(window.location.search).get("bathy") === "rtopo";
 
-    const candidates = [
-      withBase("data/bathy_RTopo_ds.json"),
-      withBase("data/bathy_RTopo.json"),
-      withBase("data/bathy.json"),
-    ];
+    const paths = {
+      bathy: withBase("data/bathy.json"),
+      rtopoDs: withBase("data/bathy_RTopo_ds.json"),
+      rtopo: withBase("data/bathy_RTopo.json"),
+    } as const;
+
+    const effective = forceFull ? "rtopo" : (bathySource ?? "auto");
+    const candidates = (() => {
+      if (effective === "bathy") return [paths.bathy, paths.rtopoDs, paths.rtopo];
+      if (effective === "rtopo_ds") return [paths.rtopoDs, paths.bathy, paths.rtopo];
+      if (effective === "rtopo") return [paths.rtopo, paths.rtopoDs, paths.bathy];
+      return [paths.rtopoDs, paths.rtopo, paths.bathy];
+    })();
     let json: BathyGrid | null = null;
     for (const url of candidates) {
       // Avoid loading huge JSON by accident; prefer a downsampled file.
-      if (!forceFull && url.endsWith("bathy_RTopo.json")) {
+      if (effective !== "rtopo" && url.endsWith("bathy_RTopo.json")) {
         try {
           const head = await fetch(url, { method: "HEAD" });
           const len = Number(head.headers.get("Content-Length") ?? "0");
@@ -194,10 +214,48 @@ async function tryLoadBathyJson(): Promise<BathyGrid | null> {
 }
 
 const DEFAULT_SCENE_CAMERA = {
-  eye: { x: 1.65, y: -1.9, z: 0.6 },
+  // Meridional (northward-facing) default view: camera is south of domain.
+  eye: { x: 0.12, y: -2.15, z: 0.62 },
 };
 
+const SCENE_CAMERA_STORAGE_KEY = "gs_scene_camera_v1";
+
+function normalizeCamera(input: any): any | null {
+  if (!input || typeof input !== "object") return null;
+  const pickVec3 = (v: any) => {
+    if (!v || typeof v !== "object") return null;
+    const x = Number(v.x);
+    const y = Number(v.y);
+    const z = Number(v.z);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
+    return { x, y, z };
+  };
+
+  const eye = pickVec3((input as any).eye);
+  const up = pickVec3((input as any).up);
+  const center = pickVec3((input as any).center);
+  const projectionType =
+    typeof (input as any)?.projection?.type === "string" ? (input as any).projection.type : null;
+
+  const out: any = {};
+  if (eye) out.eye = eye;
+  if (up) out.up = up;
+  if (center) out.center = center;
+  if (projectionType) out.projection = { type: projectionType };
+  return Object.keys(out).length ? out : null;
+}
+
 export default function Basemap3D(props: {
+  bathySource?: "auto" | "bathy" | "rtopo_ds" | "rtopo";
+  depthRatio?: number;
+  depthWarp?: {
+    mode: "linear" | "upper";
+    // Positive meters (e.g., 2500 means "upper 2500 m").
+    focusDepthM?: number;
+    // 0..1. Lower compresses deep ocean more; 1 == linear.
+    deepRatio?: number;
+  };
+  showBathy?: boolean;
   horizontalOverlay?: {
     enabled: boolean;
     imagePath: string;
@@ -228,6 +286,8 @@ export default function Basemap3D(props: {
     transectImage: "off" | "loading" | "ready" | "failed";
   }) => void;
   showBathyContours?: boolean;
+  showFieldContours?: boolean;
+  cameraResetNonce?: number;
 }) {
   const [grid, setGrid] = useState<BathyGrid | null>(null);
   const [bathyStatus, setBathyStatus] = useState<"loading" | "file" | "synthetic">(
@@ -236,6 +296,10 @@ export default function Basemap3D(props: {
   const [Plot, setPlot] = useState<React.ComponentType<any> | null>(null);
   const plotlyLibRef = useRef<any | null>(null);
   const didInitCameraRef = useRef(false);
+  const graphDivRef = useRef<any | null>(null);
+  const lastSavedCameraJsonRef = useRef<string | null>(null);
+  const saveRafRef = useRef<number | null>(null);
+  const initialCameraRef = useRef<any | null>(null);
   const [plotStatus, setPlotStatus] = useState<"loading" | "ready" | "failed">(
     "loading"
   );
@@ -265,7 +329,8 @@ export default function Basemap3D(props: {
 
   useEffect(() => {
     let cancelled = false;
-    tryLoadBathyJson().then((g) => {
+    setBathyStatus("loading");
+    tryLoadBathyJson(props.bathySource).then((g) => {
       if (cancelled) return;
       setGrid(g);
       setBathyStatus(g ? "file" : "synthetic");
@@ -273,7 +338,7 @@ export default function Basemap3D(props: {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [props.bathySource]);
 
   useEffect(() => {
     const overlay = props.horizontalOverlay;
@@ -370,6 +435,20 @@ export default function Basemap3D(props: {
   }, []);
 
   useEffect(() => {
+    // Load initial camera once (per mount). If present, it becomes the default view for this user.
+    if (initialCameraRef.current) return;
+    try {
+      const raw = window.localStorage.getItem(SCENE_CAMERA_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      const cam = normalizeCamera(parsed);
+      if (cam) initialCameraRef.current = cam;
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
     props.onStatusChange?.({
       plotly: plotStatus,
       bathy: bathyStatus,
@@ -386,6 +465,54 @@ export default function Basemap3D(props: {
   const bluesPalette = useMemo<RGB[]>(() => blues_r_256(), []);
   const topoPalette = useMemo<RGB[]>(() => topo_256(), []);
   const topoColorscale = useMemo(() => paletteToColorscale(topoPalette), [topoPalette]);
+
+  const depthWarp = useMemo(() => {
+    const mode = props.depthWarp?.mode ?? "linear";
+    const focusDepthM = Math.max(50, Math.min(20000, Number(props.depthWarp?.focusDepthM ?? 2500)));
+    const deepRatio = Math.max(0.05, Math.min(1, Number(props.depthWarp?.deepRatio ?? 0.25)));
+    return { mode, focusDepthM, deepRatio } as const;
+  }, [props.depthWarp?.deepRatio, props.depthWarp?.focusDepthM, props.depthWarp?.mode]);
+
+  const scaleZ = useCallback(
+    (z: number) => {
+      const v = Number(z);
+      if (!Number.isFinite(v)) return v;
+      if (v >= 0) return v; // above or at sea level: leave as-is
+      if (depthWarp.mode === "linear") return v;
+
+      // Upper-focus: keep 0..-focusDepth linear, compress deeper part by deepRatio.
+      const depth = -v; // positive down
+      const focus = depthWarp.focusDepthM;
+      if (depth <= focus) return v;
+      const scaledDepth = focus + (depth - focus) * depthWarp.deepRatio;
+      return -scaledDepth;
+    },
+    [depthWarp.deepRatio, depthWarp.focusDepthM, depthWarp.mode]
+  );
+
+  const bathyZPlot = useMemo(() => {
+    // Apply non-linear depth scaling to the geometry only.
+    // Keep bathy surfacecolor in physical units for the colormap.
+    return bathy.z.map((row) => row.map((v) => (Number.isFinite(v) ? scaleZ(v) : v)));
+  }, [bathy.z, scaleZ]);
+
+  const zAxisTicks = useMemo(() => {
+    // Show physical depths on the axis even if we warp the geometry.
+    let minDepth = 0;
+    for (const row of bathy.z) {
+      for (const v of row) {
+        const x = Number(v);
+        if (!Number.isFinite(x)) continue;
+        if (x < minDepth) minDepth = x;
+      }
+    }
+    const physical = [0, -500, -1000, -1500, -2000, -2500, -3000, -4000, -5000, -6000].filter(
+      (d) => d >= minDepth - 1e-6
+    );
+    const tickvals = physical.map((d) => scaleZ(d));
+    const ticktext = physical.map((d) => `${Math.round(d)}`);
+    return { tickvals, ticktext };
+  }, [bathy.z, scaleZ]);
 
   function buildSstLookup(img: ImageData, vmin: number, vmax: number) {
     // Extract unique colors and order them along a reference RdYlBu_r palette
@@ -546,6 +673,7 @@ export default function Basemap3D(props: {
   }
 
   const data = useMemo<Partial<PlotData>[]>(() => {
+    const showBathy = props.showBathy !== false;
     const numericH = props.horizontalField?.enabled ? props.horizontalField : null;
     const pngOverlayEnabled = Boolean(props.horizontalOverlay?.enabled && horizontalColor);
     const overlayEnabled = Boolean(numericH || pngOverlayEnabled);
@@ -610,17 +738,21 @@ export default function Basemap3D(props: {
     const overlayColorbarTicks =
       numericH?.colorbarTicks ??
       (props.horizontalOverlay?.showScale ? [-1, 0, 1, 2, 3, 4, 5] : undefined);
+    const overlayColorbarLen = numericH?.colorbarLen;
+    const overlayColorbarX = numericH?.colorbarX;
+    const overlayColorbarY = numericH?.colorbarY;
 
     const showContours = Boolean(props.showBathyContours);
+    const showFieldContours = Boolean(props.showFieldContours);
     const traces: Partial<PlotData>[] = [];
 
-    if (textureOnBathy) {
+    if (showBathy && textureOnBathy) {
       traces.push({
         type: "surface",
         name: "Bathy (textured)",
         x: bathy.lon,
         y: bathy.lat,
-        z: bathy.z,
+        z: bathyZPlot,
         surfacecolor: overlaySurfacecolor as any,
         cmin: overlayCmin,
         cmax: overlayCmax,
@@ -651,18 +783,20 @@ export default function Basemap3D(props: {
                   ? { tickmode: "array", tickvals: overlayColorbarTicks }
                   : null),
                 ticks: "outside",
-                len: 0.55,
+                len: overlayColorbarLen ?? 0.55,
+                ...(Number.isFinite(overlayColorbarX) ? { x: overlayColorbarX } : null),
+                ...(Number.isFinite(overlayColorbarY) ? { y: overlayColorbarY } : null),
               } as any,
             }
           : null),
         opacity: 1,
       });
-    } else {
+    } else if (showBathy) {
       const zRaw = bathy.zRaw;
       if (zRaw && zRaw.length === bathy.lat.length && zRaw[0]?.length === bathy.lon.length) {
         const oceanLevels = [-4200, -3600, -3000, -2400, -1800, -1200, -600, -400, -200, -50]; // meters
         const levels = [...oceanLevels].sort((a, b) => a - b);
-        const nBins = Math.max(2, levels.length - 1);
+        const nBins = Math.max(1, levels.length - 1);
         const denom = Math.max(1, nBins - 1);
         const sampled = Array.from({ length: nBins }, (_, i) => {
           const t = denom ? i / denom : 0;
@@ -671,46 +805,57 @@ export default function Basemap3D(props: {
         });
         const toCss = (c: RGB) => `rgb(${c.r},${c.g},${c.b})`;
         const oceanColorscale: Array<[number, string]> = [];
+        const cmin = levels[0];
+        const cmax = levels[levels.length - 1];
+        const span = Math.max(1e-9, cmax - cmin);
         for (let i = 0; i < nBins; i++) {
-          const t0 = i / nBins;
-          const t1 = (i + 1) / nBins;
+          const t0 = (levels[i] - cmin) / span;
+          const t1 = (levels[i + 1] - cmin) / span;
           const color = toCss(sampled[i]);
           oceanColorscale.push([t0, color], [t1, color]);
         }
+        oceanColorscale[0][0] = 0;
         oceanColorscale[oceanColorscale.length - 1][0] = 1;
 
         const zOcean: number[][] = new Array(bathy.lat.length);
+        const zOceanPlot: number[][] = new Array(bathy.lat.length);
         const zLand: number[][] = new Array(bathy.lat.length);
         const cLand: number[][] = new Array(bathy.lat.length);
         let landMax = 0;
         for (let j = 0; j < bathy.lat.length; j++) {
           const oceanRow: number[] = new Array(bathy.lon.length);
+          const oceanPlotRow: number[] = new Array(bathy.lon.length);
           const landRow: number[] = new Array(bathy.lon.length);
           const cRow: number[] = new Array(bathy.lon.length);
           for (let i = 0; i < bathy.lon.length; i++) {
             const raw = Number(zRaw[j][i]);
             if (!Number.isFinite(raw)) {
               oceanRow[i] = Number.NaN;
+              oceanPlotRow[i] = Number.NaN;
               landRow[i] = Number.NaN;
               cRow[i] = Number.NaN;
               continue;
             }
             if (raw < 0) {
               oceanRow[i] = Number(bathy.z[j][i]);
+              oceanPlotRow[i] = scaleZ(Number(bathy.z[j][i]));
               landRow[i] = Number.NaN;
               cRow[i] = Number.NaN;
             } else if (raw > 0) {
               oceanRow[i] = Number.NaN;
+              oceanPlotRow[i] = Number.NaN;
               landRow[i] = 0;
               cRow[i] = raw;
               landMax = Math.max(landMax, raw);
             } else {
               oceanRow[i] = 0;
+              oceanPlotRow[i] = scaleZ(0);
               landRow[i] = Number.NaN;
               cRow[i] = Number.NaN;
             }
           }
           zOcean[j] = oceanRow;
+          zOceanPlot[j] = oceanPlotRow;
           zLand[j] = landRow;
           cLand[j] = cRow;
         }
@@ -720,10 +865,10 @@ export default function Basemap3D(props: {
           name: "Ocean bathymetry",
           x: bathy.lon,
           y: bathy.lat,
-          z: zOcean as any,
+          z: zOceanPlot as any,
           surfacecolor: zOcean as any,
-          cmin: levels[0],
-          cmax: levels[levels.length - 1],
+          cmin,
+          cmax,
           colorscale: oceanColorscale as any,
           showscale: false,
           lighting: { ambient: 0.85, diffuse: 0.35, specular: 0.05, roughness: 0.95 } as any,
@@ -766,7 +911,7 @@ export default function Basemap3D(props: {
           name: "Bathy",
           x: bathy.lon,
           y: bathy.lat,
-          z: bathy.z,
+          z: bathyZPlot,
           colorscale: [
             [0.0, "#06162a"],
             [0.2, "#0b2b4a"],
@@ -800,16 +945,112 @@ export default function Basemap3D(props: {
       overlayEnabled &&
       overlayMode === "surface"
     ) {
-      const bounds = numericH?.bounds ?? props.horizontalOverlay?.bounds;
       const zPlane = numericH?.zPlane ?? 0;
-      const zSheet = bathy.z.map((row, j) =>
-        row.map((_, i) => {
-          const val = overlaySurfacecolor?.[j]?.[i];
-          if (val === undefined || !Number.isFinite(val)) return Number.NaN;
-          if (bounds) {
-            const { lonMin, lonMax, latMin, latMax } = bounds;
-            const lon = bathy.lon[i];
-            const lat = bathy.lat[j];
+      const zPlanePlot = scaleZ(zPlane);
+      const FIELD_CONTOUR_EPS_M = 2;
+
+      // Prefer plotting numeric fields on their native lon/lat grid to avoid mismatches
+      // between the model grid and the bathymetry grid near coasts/land.
+      const plane = (() => {
+        if (numericH?.values) {
+          const values = numericH.values;
+          const ny = values.length;
+          const nx = values[0]?.length ?? 0;
+          if (
+            Array.isArray(numericH.lon) &&
+            Array.isArray(numericH.lat) &&
+            numericH.lon.length === nx &&
+            numericH.lat.length === ny
+          ) {
+            return {
+              x: numericH.lon,
+              y: numericH.lat,
+              values,
+              bounds: numericH.bounds,
+              zeroAsMissing: Boolean(numericH.zeroAsMissing),
+              maskDryByBathy: numericH.maskDryByBathy !== false,
+            };
+          }
+          // Fallback: if already bathy-shaped, plot directly.
+          if (ny === bathy.lat.length && nx === bathy.lon.length) {
+            return {
+              x: bathy.lon,
+              y: bathy.lat,
+              values,
+              bounds: numericH.bounds,
+              zeroAsMissing: Boolean(numericH.zeroAsMissing),
+              maskDryByBathy: numericH.maskDryByBathy !== false,
+            };
+          }
+          // Last resort: use the resampled overlaySurfacecolor on the bathy grid.
+          return {
+            x: bathy.lon,
+            y: bathy.lat,
+            values: (overlaySurfacecolor as any) ?? values,
+            bounds: numericH.bounds,
+            zeroAsMissing: Boolean(numericH.zeroAsMissing),
+            maskDryByBathy: numericH.maskDryByBathy !== false,
+          };
+        }
+        return {
+          x: bathy.lon,
+          y: bathy.lat,
+          values: overlaySurfacecolor as any,
+          bounds: props.horizontalOverlay?.bounds,
+          zeroAsMissing: false,
+          maskDryByBathy: false,
+        };
+      })();
+
+      const lonMap =
+        plane.maskDryByBathy
+          ? plane.x.map((xv) => {
+              let best = 0;
+              let bestD = Infinity;
+              for (let i = 0; i < bathy.lon.length; i++) {
+                const d = Math.abs(bathy.lon[i] - xv);
+                if (d < bestD) {
+                  bestD = d;
+                  best = i;
+                }
+              }
+              return best;
+            })
+          : null;
+      const latMap =
+        plane.maskDryByBathy
+          ? plane.y.map((yv) => {
+              let best = 0;
+              let bestD = Infinity;
+              for (let j = 0; j < bathy.lat.length; j++) {
+                const d = Math.abs(bathy.lat[j] - yv);
+                if (d < bestD) {
+                  bestD = d;
+                  best = j;
+                }
+              }
+              return best;
+            })
+          : null;
+
+      const valuesMasked: number[][] = plane.values.map((row, j) =>
+        row.map((v, i) => {
+          const val = Number(v);
+          if (!Number.isFinite(val)) return Number.NaN;
+          if (plane.zeroAsMissing && val === 0) return Number.NaN;
+
+          // Hide overlay on dry cells (nearest bathy depth at/above sea level).
+          if (lonMap && latMap) {
+            const jj = latMap[j];
+            const ii = lonMap[i];
+            const depth = Number(bathy.z[jj]?.[ii]);
+            if (Number.isFinite(depth) && depth >= -1e-6) return Number.NaN;
+          }
+
+          if (plane.bounds) {
+            const { lonMin, lonMax, latMin, latMax } = plane.bounds;
+            const lon = plane.x[i];
+            const lat = plane.y[j];
             const inside =
               lon >= Math.min(lonMin, lonMax) &&
               lon <= Math.max(lonMin, lonMax) &&
@@ -817,16 +1058,28 @@ export default function Basemap3D(props: {
               lat <= Math.max(latMin, latMax);
             if (!inside) return Number.NaN;
           }
-          return zPlane;
+
+          return val;
+        })
+      );
+
+      const zSheet = valuesMasked.map((row) =>
+        row.map((val) => {
+          if (!Number.isFinite(val)) return Number.NaN;
+          if (!showFieldContours) return zPlanePlot;
+          const t = (val - overlayCmin) / Math.max(1e-9, overlayCmax - overlayCmin);
+          const bump = FIELD_CONTOUR_EPS_M * Math.max(0, Math.min(1, t));
+          return zPlanePlot + bump;
         })
       );
       traces.push({
         type: "surface",
         name: "Overlay (surface)",
-        x: bathy.lon,
-        y: bathy.lat,
+        x: plane.x,
+        y: plane.y,
         z: zSheet,
-        surfacecolor: overlaySurfacecolor as any,
+        surfacecolor: valuesMasked as any,
+        text: valuesMasked as any,
         cmin: overlayCmin,
         cmax: overlayCmax,
         colorscale: overlayColorscale as any,
@@ -846,7 +1099,28 @@ export default function Basemap3D(props: {
         opacity: overlayOpacity,
         lighting: { ambient: 1.0, diffuse: 0.15, specular: 0.0, roughness: 1.0 } as any,
         flatshading: true as any,
-        hoverinfo: "skip",
+        ...(showFieldContours
+          ? {
+              contours: {
+                z: {
+                  show: true,
+                  highlight: true,
+                  usecolormap: false,
+                  color: "rgba(255,255,255,0.22)",
+                  highlightcolor: "rgba(255,255,255,0.40)",
+                  start: zPlanePlot,
+                  end: zPlanePlot + FIELD_CONTOUR_EPS_M,
+                  size: Math.max(0.05, FIELD_CONTOUR_EPS_M / 12),
+                  project: { z: false },
+                },
+              } as any,
+            }
+          : null),
+        hovertemplate:
+          `Lon %{x:.2f}°<br>` +
+          `Lat %{y:.2f}°<br>` +
+          `${overlayColorbarTitle}: %{text:.3f}` +
+          `<extra></extra>`,
       });
     }
 
@@ -856,7 +1130,13 @@ export default function Basemap3D(props: {
       const p = planes[idx];
       const { x, y, values } = fieldGridForPlane(p);
       const zPlane = p.zPlane ?? 0;
-      const zSheet = y.map(() => x.map(() => zPlane));
+      const zPlanePlot = scaleZ(zPlane);
+      const zSheet = y.map((_, j) =>
+        x.map((_, i) => {
+          const v = values?.[j]?.[i];
+          return v === undefined || !Number.isFinite(Number(v)) ? Number.NaN : zPlanePlot;
+        })
+      );
       const opacity = p.opacity ?? 0.25;
       const showScale = Boolean(p.showScale);
       traces.push({
@@ -866,6 +1146,7 @@ export default function Basemap3D(props: {
         y,
         z: zSheet as any,
         surfacecolor: values as any,
+        text: values as any,
         cmin: p.cmin,
         cmax: p.cmax,
         colorscale: p.colorscale as any,
@@ -876,20 +1157,27 @@ export default function Basemap3D(props: {
                 title: { text: p.colorbarTitle ?? "Value" },
                 ...(p.colorbarTicks ? { tickmode: "array", tickvals: p.colorbarTicks } : null),
                 ticks: "outside",
-                len: 0.55,
+                len: p.colorbarLen ?? 0.55,
+                ...(Number.isFinite(p.colorbarX) ? { x: p.colorbarX } : null),
+                ...(Number.isFinite(p.colorbarY) ? { y: p.colorbarY } : null),
               } as any,
             }
           : null),
         opacity,
         lighting: { ambient: 1.0, diffuse: 0.15, specular: 0.0, roughness: 1.0 } as any,
         flatshading: true as any,
-        hoverinfo: "skip",
+        hovertemplate:
+          `Lon %{x:.2f}°<br>` +
+          `Lat %{y:.2f}°<br>` +
+          `${p.colorbarTitle ?? "Value"}: %{text:.3f}` +
+          `<extra></extra>`,
       });
     }
 
     const numericT = props.transectField?.enabled ? props.transectField : null;
     if (numericT) {
-      const zCurtain = numericT.z.map((zv) => numericT.lon.map(() => zv));
+      const zScaled = numericT.z.map((zv) => scaleZ(zv));
+      const zCurtain = zScaled.map((zv) => numericT.lon.map(() => zv));
       const opacity = numericT.opacity ?? 0.9;
       traces.push({
         type: "surface",
@@ -898,6 +1186,7 @@ export default function Basemap3D(props: {
         y: numericT.z.map(() => numericT.lat),
         z: zCurtain as any,
         surfacecolor: numericT.values as any,
+        text: numericT.values as any,
         cmin: numericT.cmin,
         cmax: numericT.cmax,
         colorscale: numericT.colorscale as any,
@@ -910,20 +1199,28 @@ export default function Basemap3D(props: {
                   ? { tickmode: "array", tickvals: numericT.colorbarTicks }
                   : null),
                 ticks: "outside",
-                len: 0.55,
+                len: numericT.colorbarLen ?? 0.55,
+                ...(Number.isFinite(numericT.colorbarX) ? { x: numericT.colorbarX } : null),
+                ...(Number.isFinite(numericT.colorbarY) ? { y: numericT.colorbarY } : null),
               } as any,
             }
           : null),
         opacity,
-        hoverinfo: "skip",
+        hovertemplate:
+          `Lon %{x:.2f}°<br>` +
+          `Depth %{customdata:.0f} m<br>` +
+          `${numericT.colorbarTitle ?? "Value"}: %{text:.3f}` +
+          `<extra></extra>`,
+        customdata: numericT.z.map((zv) => numericT.lon.map(() => zv)) as any,
       });
     } else if (props.transectOverlay?.enabled && transectCurtain) {
       const opacity = props.transectOverlay.opacity ?? 0.9;
+      const zScaled = transectCurtain.z.map((row) => row.map((v) => (Number.isFinite(v) ? scaleZ(v) : v)));
       traces.push({
         type: "surface",
         x: transectCurtain.x,
         y: transectCurtain.y,
-        z: transectCurtain.z as any,
+        z: zScaled as any,
         surfacecolor: transectCurtain.surfacecolor as any,
         cmin: 0,
         cmax: 255,
@@ -937,18 +1234,62 @@ export default function Basemap3D(props: {
     return traces;
   }, [
     bathy,
+    bathyZPlot,
     horizontalColor,
     props.horizontalField,
+    props.horizontalPlanes,
     props.horizontalOverlay?.enabled,
     props.horizontalOverlay?.showScale,
     props.horizontalOverlay?.mode,
     props.horizontalOverlay?.opacity,
+    props.showBathy,
     props.transectField,
     props.transectOverlay?.enabled,
     props.transectOverlay?.opacity,
     props.showBathyContours,
+    props.showFieldContours,
+    scaleZ,
     transectCurtain,
   ]);
+
+  const fixedRanges = useMemo(() => {
+    const lon = bathy.lon;
+    const lat = bathy.lat;
+    const xMin = Number(lon?.[0]);
+    const xMax = Number(lon?.[lon.length - 1]);
+    const yMin = Number(lat?.[0]);
+    const yMax = Number(lat?.[lat.length - 1]);
+
+    let zMin = Infinity;
+    let zMax = 0;
+    for (let j = 0; j < bathyZPlot.length; j++) {
+      const row = bathyZPlot[j] as any;
+      if (!Array.isArray(row)) continue;
+      for (let i = 0; i < row.length; i++) {
+        const v = Number(row[i]);
+        if (!Number.isFinite(v)) continue;
+        zMin = Math.min(zMin, v);
+        zMax = Math.max(zMax, v);
+      }
+    }
+    if (!Number.isFinite(zMin)) zMin = scaleZ(-5000);
+
+    // Keep a small buffer above sea level so toggling surface planes (sea ice, etc)
+    // doesn't change the plot's autoscale/zoom feel.
+    zMax = Math.max(zMax, scaleZ(20));
+
+    return {
+      x: [Math.min(xMin, xMax), Math.max(xMin, xMax)] as [number, number],
+      y: [Math.min(yMin, yMax), Math.max(yMin, yMax)] as [number, number],
+      z: [zMin, zMax] as [number, number],
+    };
+  }, [bathy.lat, bathy.lon, bathyZPlot, scaleZ]);
+
+  const depthRatio = useMemo(() => {
+    const v = Number(props.depthRatio);
+    if (!Number.isFinite(v) || v <= 0) return 0.35;
+    return Math.max(0.05, Math.min(3, v));
+  }, [props.depthRatio]);
 
   const layout = useMemo<Partial<Layout>>(
     () => ({
@@ -959,15 +1300,25 @@ export default function Basemap3D(props: {
       scene: {
         // Preserve 3D camera across updates while animating.
         uirevision: "keep",
-        xaxis: { title: "Longitude", showgrid: false, zeroline: false },
-        yaxis: { title: "Latitude", showgrid: false, zeroline: false },
-        zaxis: { title: "Depth (m)", showgrid: false, zeroline: false },
+        // Shift the object slightly right so it sits closer to the colorbar.
+        domain: { x: [0.24, 1], y: [0, 1] },
+        xaxis: { title: "Longitude", showgrid: false, zeroline: false, range: fixedRanges.x as any },
+        yaxis: { title: "Latitude", showgrid: false, zeroline: false, range: fixedRanges.y as any },
+        zaxis: {
+          title: "Depth (m)",
+          showgrid: false,
+          zeroline: false,
+          tickmode: "array",
+          tickvals: zAxisTicks.tickvals as any,
+          ticktext: zAxisTicks.ticktext as any,
+          range: fixedRanges.z as any,
+        },
         dragmode: "orbit",
         aspectmode: "manual",
-        aspectratio: { x: 1.1, y: 1.0, z: 0.35 },
+        aspectratio: { x: 1.1, y: 1.0, z: depthRatio },
       }
     }),
-    []
+    [depthRatio, fixedRanges.x, fixedRanges.y, fixedRanges.z, zAxisTicks.ticktext, zAxisTicks.tickvals]
   );
 
   const plotConfig = useMemo(
@@ -985,12 +1336,65 @@ export default function Basemap3D(props: {
     didInitCameraRef.current = true;
     const Plotly = plotlyLibRef.current;
     if (!Plotly || !graphDiv) return;
+    graphDivRef.current = graphDiv;
     // Set a good initial view once; after that, user interactions are preserved via uirevision.
     try {
-      void Plotly.relayout(graphDiv, { "scene.camera": DEFAULT_SCENE_CAMERA });
+      const cam = initialCameraRef.current ?? DEFAULT_SCENE_CAMERA;
+      void Plotly.relayout(graphDiv, { "scene.camera": cam });
+      // Persist the initial camera once so revisiting the page keeps the same view,
+      // even if the user doesn't touch the scene.
+      try {
+        const existing = window.localStorage.getItem(SCENE_CAMERA_STORAGE_KEY);
+        if (!existing) window.localStorage.setItem(SCENE_CAMERA_STORAGE_KEY, JSON.stringify(cam));
+      } catch {
+        // ignore
+      }
     } catch {
       // ignore
     }
+  }, []);
+
+  useEffect(() => {
+    if (props.cameraResetNonce == null) return;
+    const Plotly = plotlyLibRef.current;
+    const graphDiv = graphDivRef.current;
+    if (!Plotly || !graphDiv) return;
+    try {
+      const cam = DEFAULT_SCENE_CAMERA;
+      initialCameraRef.current = cam;
+      lastSavedCameraJsonRef.current = null;
+      void Plotly.relayout(graphDiv, { "scene.camera": cam });
+      try {
+        window.localStorage.setItem(SCENE_CAMERA_STORAGE_KEY, JSON.stringify(cam));
+      } catch {
+        // ignore
+      }
+    } catch {
+      // ignore
+    }
+  }, [props.cameraResetNonce]);
+
+  const handleRelayout = useCallback((event: any, graphDivMaybe: any) => {
+    const graphDiv = graphDivMaybe ?? graphDivRef.current;
+    if (!graphDiv) return;
+
+    // Try to read the full current camera from graphDiv (more robust than piecing from relayout keys).
+    const cam = normalizeCamera(graphDiv?.layout?.scene?.camera);
+    if (!cam) return;
+
+    // Debounce writes to localStorage to avoid excessive churn while orbiting.
+    if (saveRafRef.current != null) window.cancelAnimationFrame(saveRafRef.current);
+    saveRafRef.current = window.requestAnimationFrame(() => {
+      saveRafRef.current = null;
+      try {
+        const json = JSON.stringify(cam);
+        if (json === lastSavedCameraJsonRef.current) return;
+        lastSavedCameraJsonRef.current = json;
+        window.localStorage.setItem(SCENE_CAMERA_STORAGE_KEY, json);
+      } catch {
+        // ignore
+      }
+    });
   }, []);
 
   if (!Plot) {
@@ -1054,6 +1458,7 @@ export default function Basemap3D(props: {
         layout={layout as Layout}
         config={plotConfig}
         onInitialized={handleInitialized}
+        onRelayout={handleRelayout as any}
         style={{ width: "100%", height: "100%" }}
         useResizeHandler
       />

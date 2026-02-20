@@ -47,18 +47,100 @@ body{
   backdrop-filter: blur(10px);
 }
 
-.sidebar{
+.controlPanel{
   position: absolute;
   left: 16px;
-  top: 16px;
   bottom: 16px;
-  width: 360px;
-  padding: 14px 14px 10px;
+  width: min(420px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  padding: 12px 12px 10px;
   display: flex;
   flex-direction: column;
-  min-height: 0;
+  gap: 10px;
   overflow: auto;
   overscroll-behavior: contain;
+}
+
+.panelOpenButton{
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,0.25);
+  background: rgba(0,0,0,0.55);
+  color: rgba(255,255,255,0.92);
+  cursor: pointer;
+  pointer-events: auto;
+  display: grid;
+  place-items: center;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.panelHeader{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  user-select: none;
+  cursor: grab;
+  padding: 2px 2px;
+  touch-action: none;
+}
+.panelHeader:active{ cursor: grabbing; }
+
+.panelHeaderRight{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panelIconButton{
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  border: 1px solid rgba(255,255,255,0.18);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.9);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  line-height: 1;
+}
+
+.section{
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.02);
+  padding: 8px 10px;
+}
+.section > summary{
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 800;
+  color: rgba(255,255,255,0.78);
+  user-select: none;
+}
+.section > summary::-webkit-details-marker{ display: none; }
+.section > summary::after{
+  content: "▾";
+  opacity: 0.7;
+  transform: rotate(-90deg);
+  transition: transform 120ms ease;
+}
+.section[open] > summary::after{ transform: rotate(0deg); }
+
+.sectionBody{
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
 }
 
 .title{
@@ -106,6 +188,53 @@ body{
 .tabActive{
   border-color: rgba(103,232,249,0.40);
   background: linear-gradient(180deg, rgba(103,232,249,0.14), rgba(167,139,250,0.08));
+}
+
+.toggleRow{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.toggle{
+  width: 46px;
+  height: 26px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.18);
+  background: rgba(255,255,255,0.10);
+  padding: 0;
+  cursor: pointer;
+  position: relative;
+  outline: none;
+}
+
+.toggleOn{
+  background: #34c759;
+  border-color: rgba(52,199,89,0.75);
+}
+
+.toggleKnob{
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.95);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+  transition: transform 140ms ease;
+}
+
+.toggleOn .toggleKnob{
+  transform: translateX(20px);
+}
+
+.toggle:disabled{
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 label{
@@ -236,11 +365,11 @@ input[type="range"]{
 }
 
 @media (max-width: 960px) {
-  .sidebar{
-    position: static;
-    width: auto;
-    height: auto;
-    margin-bottom: 12px;
+  .controlPanel{
+    left: 12px;
+    bottom: 12px;
+    width: calc(100vw - 24px);
+    max-height: calc(100vh - 24px);
   }
   .viewer{
     position: static;

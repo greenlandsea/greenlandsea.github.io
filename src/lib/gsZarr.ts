@@ -135,6 +135,29 @@ async function loadBathyLonLat(): Promise<BathyGrid> {
 }
 
 const arrayPromiseCache = new Map<string, Promise<any>>();
+const horizontalSliceCache = new Map<string, Promise<number[][]>>();
+const transectSliceCache = new Map<string, Promise<{ values: number[][] }>>();
+const seaIceSliceCache = new Map<string, Promise<number[][]>>();
+
+function cachePromise<T>(
+  cache: Map<string, Promise<T>>,
+  key: string,
+  maxEntries: number,
+  factory: () => Promise<T>
+): Promise<T> {
+  const existing = cache.get(key);
+  if (existing) return existing;
+  const promise = factory().catch((e) => {
+    cache.delete(key);
+    throw e;
+  });
+  cache.set(key, promise);
+  if (cache.size > maxEntries) {
+    const first = cache.keys().next().value as string | undefined;
+    if (first) cache.delete(first);
+  }
+  return promise;
+}
 
 async function openArray(storeUrl: string, name: string) {
   const key = `${storeUrl}::${name}`;
@@ -309,13 +332,16 @@ export async function loadHorizontalSlice(opts: {
   nLat: number;
   nLon: number;
 }): Promise<number[][]> {
-  const arr = await openArray(opts.storeUrl, opts.varId);
-  const out = await zarr.get(arr, [opts.tIndex, opts.zIndex, null, null] as any);
-  const shape = out.shape;
-  if (shape.length !== 2) {
-    throw new Error(`Expected 2D slice, got shape [${shape.join(",")}]`);
-  }
-  return reshape2D(out.data as any, shape[0], shape[1]);
+  const key = `${opts.storeUrl}|${opts.varId}|${opts.tIndex}|${opts.zIndex}`;
+  return cachePromise(horizontalSliceCache, key, 48, async () => {
+    const arr = await openArray(opts.storeUrl, opts.varId);
+    const out = await zarr.get(arr, [opts.tIndex, opts.zIndex, null, null] as any);
+    const shape = out.shape;
+    if (shape.length !== 2) {
+      throw new Error(`Expected 2D slice, got shape [${shape.join(",")}]`);
+    }
+    return reshape2D(out.data as any, shape[0], shape[1]);
+  });
 }
 
 export async function loadTransectSlice(opts: {
@@ -324,13 +350,16 @@ export async function loadTransectSlice(opts: {
   tIndex: number;
   yIndex: number; // index into YC
 }): Promise<{ values: number[][] }> {
-  const arr = await openArray(opts.storeUrl, opts.varId);
-  const out = await zarr.get(arr, [opts.tIndex, null, opts.yIndex, null] as any);
-  const shape = out.shape;
-  if (shape.length !== 2) {
-    throw new Error(`Expected 2D transect, got shape [${shape.join(",")}]`);
-  }
-  return { values: reshape2D(out.data as any, shape[0], shape[1]) };
+  const key = `${opts.storeUrl}|${opts.varId}|${opts.tIndex}|${opts.yIndex}`;
+  return cachePromise(transectSliceCache, key, 36, async () => {
+    const arr = await openArray(opts.storeUrl, opts.varId);
+    const out = await zarr.get(arr, [opts.tIndex, null, opts.yIndex, null] as any);
+    const shape = out.shape;
+    if (shape.length !== 2) {
+      throw new Error(`Expected 2D transect, got shape [${shape.join(",")}]`);
+    }
+    return { values: reshape2D(out.data as any, shape[0], shape[1]) };
+  });
 }
 
 export async function load3DFieldAtTime(opts: {
@@ -371,11 +400,14 @@ export async function loadSeaIce2D(opts: {
   storeUrl: string;
   tIndex: number;
 }): Promise<number[][]> {
-  const arr = await openArray(opts.storeUrl, "SIarea");
-  const out = await zarr.get(arr, [opts.tIndex, null, null] as any);
-  const shape = out.shape;
-  if (shape.length !== 2) {
-    throw new Error(`Expected 2D SIarea, got shape [${shape.join(",")}]`);
-  }
-  return reshape2D(out.data as any, shape[0], shape[1]);
+  const key = `${opts.storeUrl}|SIarea|${opts.tIndex}`;
+  return cachePromise(seaIceSliceCache, key, 64, async () => {
+    const arr = await openArray(opts.storeUrl, "SIarea");
+    const out = await zarr.get(arr, [opts.tIndex, null, null] as any);
+    const shape = out.shape;
+    if (shape.length !== 2) {
+      throw new Error(`Expected 2D SIarea, got shape [${shape.join(",")}]`);
+    }
+    return reshape2D(out.data as any, shape[0], shape[1]);
+  });
 }
