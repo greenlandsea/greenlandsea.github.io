@@ -104,6 +104,13 @@ function reshape2D(data: ArrayLike<number>, nRows: number, nCols: number): numbe
   return out;
 }
 
+function ensureFloat32(data: any): Float32Array {
+  if (data instanceof Float32Array) return data;
+  const out = new Float32Array(data.length ?? 0);
+  for (let i = 0; i < out.length; i++) out[i] = Number(data[i]);
+  return out;
+}
+
 type BathyGrid = { lon: number[]; lat: number[] };
 
 async function loadBathyLonLat(): Promise<BathyGrid> {
@@ -324,4 +331,51 @@ export async function loadTransectSlice(opts: {
     throw new Error(`Expected 2D transect, got shape [${shape.join(",")}]`);
   }
   return { values: reshape2D(out.data as any, shape[0], shape[1]) };
+}
+
+export async function load3DFieldAtTime(opts: {
+  storeUrl: string;
+  varId: "T" | "S";
+  tIndex: number;
+}): Promise<{ data: Float32Array; nz: number; ny: number; nx: number }> {
+  const arr = await openArray(opts.storeUrl, opts.varId);
+  const out = await zarr.get(arr, [opts.tIndex, null, null, null] as any);
+  const shape = out.shape;
+  if (shape.length !== 3) {
+    throw new Error(`Expected 3D field, got shape [${shape.join(",")}]`);
+  }
+  const data = ensureFloat32(out.data as any);
+  return { data, nz: shape[0], ny: shape[1], nx: shape[2] };
+}
+
+export function slice3DTo2D(opts: {
+  data: Float32Array;
+  nz: number;
+  ny: number;
+  nx: number;
+  k: number;
+}): number[][] {
+  const { data, ny, nx, k } = opts;
+  const out: number[][] = new Array(ny);
+  const offset = k * ny * nx;
+  let p = offset;
+  for (let j = 0; j < ny; j++) {
+    const row: number[] = new Array(nx);
+    for (let i = 0; i < nx; i++) row[i] = data[p++];
+    out[j] = row;
+  }
+  return out;
+}
+
+export async function loadSeaIce2D(opts: {
+  storeUrl: string;
+  tIndex: number;
+}): Promise<number[][]> {
+  const arr = await openArray(opts.storeUrl, "SIarea");
+  const out = await zarr.get(arr, [opts.tIndex, null, null] as any);
+  const shape = out.shape;
+  if (shape.length !== 2) {
+    throw new Error(`Expected 2D SIarea, got shape [${shape.join(",")}]`);
+  }
+  return reshape2D(out.data as any, shape[0], shape[1]);
 }

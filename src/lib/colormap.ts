@@ -63,7 +63,31 @@ export function rdylbu_r_256(): RGB[] {
   return makeLinearPalette(stops, 256);
 }
 
+export function blues_r_256(): RGB[] {
+  // A reasonable "Blues_r"-like palette (dark -> light).
+  const stops = ["#08306b", "#08519c", "#2171b5", "#4292c6", "#6baed6", "#9ecae1", "#c6dbef", "#deebf7"];
+  return makeLinearPalette(stops, 256);
+}
+
+export function topo_256(): RGB[] {
+  // Approximation of cmocean.topo: deep blue -> shallow -> greens -> browns -> white.
+  const stops = [
+    "#0b1f3a",
+    "#123c6b",
+    "#1f6fb2",
+    "#52b7d6",
+    "#a7e3e1",
+    "#e6f2c5",
+    "#8fd18b",
+    "#4aa35a",
+    "#8d7b4f",
+    "#b08b5a",
+    "#d7c28f",
+    "#ffffff",
+  ];
+  return makeLinearPalette(stops, 256);
+}
+
 export function rgbKey(r: number, g: number, b: number) {
   return (r << 16) | (g << 8) | b;
 }
-

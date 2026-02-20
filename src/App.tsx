@@ -1,15 +1,18 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import Basemap3D from "./components/Basemap3D";
-import { paletteToColorscale, rdylbu_r_256 } from "./lib/colormap";
+import { blues_r_256, paletteToColorscale, rdylbu_r_256 } from "./lib/colormap";
 import {
   loadGsZarrMeta,
   loadHorizontalSlice,
+  load3DFieldAtTime,
+  loadSeaIce2D,
   loadTransectSlice,
   nearestIndex,
+  slice3DTo2D,
   type GsZarrMeta,
 } from "./lib/gsZarr";
 
-type ViewMode = "horizontal" | "transect";
+type ViewMode = "water3d" | "horizontal" | "transect";
 type VarId = "T" | "S";
 type ProjectionMode = "surface" | "bathy";
 type ColorscaleMode = "continuous" | "discrete";
@@ -79,7 +82,7 @@ function makeDiscreteColorscale(levels: number) {
 }
 
 export default function App() {
-  const [viewMode, setViewMode] = useState<ViewMode>("horizontal");
+  const [viewMode, setViewMode] = useState<ViewMode>("water3d");
   const [varId, setVarId] = useState<VarId>("T");
   const [projectOn3d, setProjectOn3d] = useState(true);
   const [projectionMode, setProjectionMode] = useState<ProjectionMode>("surface");
@@ -89,6 +92,10 @@ export default function App() {
   const [colorSettings, setColorSettings] = useState<Record<VarId, VarColorSettings>>(
     DEFAULT_COLOR_SETTINGS
   );
+  const [showSeaIce, setShowSeaIce] = useState(true);
+  const [seaIceOpacity, setSeaIceOpacity] = useState(0.55);
+  const [stackSlices, setStackSlices] = useState(10);
+  const [stackOpacity, setStackOpacity] = useState(0.14);
 
   const [timeIdx, setTimeIdx] = useState(0);
   const [depthIdx, setDepthIdx] = useState(0);
@@ -108,6 +115,10 @@ export default function App() {
   const [horizontalValues, setHorizontalValues] = useState<number[][] | null>(null);
   const [transectValues, setTransectValues] = useState<number[][] | null>(null);
   const [transectLatActual, setTransectLatActual] = useState<number | null>(null);
+  const [field3d, setField3d] = useState<{ data: Float32Array; nz: number; ny: number; nx: number } | null>(
+    null
+  );
+  const [seaIceValues, setSeaIceValues] = useState<number[][] | null>(null);
 
   const [bathyInfo, setBathyInfo] = useState<{
     plotly: "loading" | "ready" | "failed";
@@ -190,6 +201,8 @@ export default function App() {
       setHorizontalValues(null);
       setTransectValues(null);
       setTransectLatActual(null);
+      setField3d(null);
+      setSeaIceValues(null);
       return;
     }
 
@@ -199,7 +212,23 @@ export default function App() {
 
     (async () => {
       try {
-        if (viewMode === "horizontal") {
+        if (viewMode === "water3d") {
+          const v3 = await load3DFieldAtTime({
+            storeUrl: meta.storeUrl,
+            varId,
+            tIndex: safeTimeIdx,
+          });
+          const ice = showSeaIce
+            ? await loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex: safeTimeIdx })
+            : null;
+          if (cancelled) return;
+          setField3d(v3);
+          setSeaIceValues(ice);
+          setHorizontalValues(null);
+          setTransectValues(null);
+          setTransectLatActual(null);
+          setSliceStatus("ready");
+        } else if (viewMode === "horizontal") {
           const values = await loadHorizontalSlice({
             storeUrl: meta.storeUrl,
             varId,
@@ -212,6 +241,8 @@ export default function App() {
           setHorizontalValues(values);
           setTransectValues(null);
           setTransectLatActual(null);
+          setField3d(null);
+          setSeaIceValues(null);
           setSliceStatus("ready");
         } else {
           const yIndex = nearestIndex(meta.lat, latTarget);
@@ -225,6 +256,8 @@ export default function App() {
           setTransectValues(values);
           setHorizontalValues(null);
           setTransectLatActual(meta.lat[yIndex] ?? latTarget);
+          setField3d(null);
+          setSeaIceValues(null);
           setSliceStatus("ready");
         }
       } catch (e) {
@@ -235,6 +268,8 @@ export default function App() {
         setHorizontalValues(null);
         setTransectValues(null);
         setTransectLatActual(null);
+        setField3d(null);
+        setSeaIceValues(null);
       }
     })();
 
@@ -250,6 +285,7 @@ export default function App() {
     safeTimeIdx,
     varId,
     viewMode,
+    showSeaIce,
   ]);
 
   const horizontalField = useMemo(() => {
@@ -317,6 +353,73 @@ export default function App() {
     viewMode,
   ]);
 
+  const horizontalPlanes = useMemo(() => {
+    if (!meta || !projectOn3d || viewMode !== "water3d" || sliceStatus !== "ready" || !field3d) return undefined;
+    const nz = meta.z.length;
+    if (!nz) return undefined;
+    const n = Math.max(2, Math.min(stackSlices, nz));
+    const indices: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const t = n === 1 ? 0 : i / (n - 1);
+      indices.push(Math.round(t * (nz - 1)));
+    }
+    const planes = indices.map((k, i) => {
+      const values2d = slice3DTo2D({ data: field3d.data, nz: field3d.nz, ny: field3d.ny, nx: field3d.nx, k });
+      const showScaleThis = Boolean(showColorbar) && i === indices.length - 1;
+      return {
+        enabled: true,
+        values: values2d,
+        lon: meta.lon,
+        lat: meta.lat,
+        cmin: settings.cmin,
+        cmax: settings.cmax,
+        colorscale,
+        opacity: stackOpacity,
+        mode: "surface" as const,
+        zPlane: meta.z[k] ?? 0,
+        showScale: showScaleThis,
+        colorbarTitle: range.title,
+        colorbarTicks,
+      };
+    });
+
+    if (showSeaIce && seaIceValues) {
+      planes.push({
+        enabled: true,
+        values: seaIceValues,
+        lon: meta.lon,
+        lat: meta.lat,
+        cmin: 0,
+        cmax: 1,
+        colorscale: paletteToColorscale(blues_r_256()),
+        opacity: seaIceOpacity,
+        mode: "surface" as const,
+        zPlane: 0,
+        showScale: false,
+        colorbarTitle: "Sea ice (0–1)",
+      });
+    }
+
+    return planes;
+  }, [
+    colorbarTicks,
+    colorscale,
+    field3d,
+    meta,
+    projectOn3d,
+    range.title,
+    seaIceOpacity,
+    seaIceValues,
+    settings.cmax,
+    settings.cmin,
+    showColorbar,
+    showSeaIce,
+    sliceStatus,
+    stackOpacity,
+    stackSlices,
+    viewMode,
+  ]);
+
   const resetColorScale = useCallback(() => {
     setColorSettings((prev) => ({ ...prev, [varId]: DEFAULT_COLOR_SETTINGS[varId] }));
   }, [varId]);
@@ -342,6 +445,7 @@ export default function App() {
         onStatusChange={handleStatusChange}
         showBathyContours={showBathyContours}
         horizontalField={horizontalField}
+        horizontalPlanes={horizontalPlanes}
         transectField={transectField}
       />
 
@@ -357,6 +461,12 @@ export default function App() {
 
           <div className="controls">
             <div className="tabs">
+              <button
+                className={`tab ${viewMode === "water3d" ? "tabActive" : ""}`}
+                onClick={() => setViewMode("water3d")}
+              >
+                3D Water
+              </button>
               <button
                 className={`tab ${viewMode === "horizontal" ? "tabActive" : ""}`}
                 onClick={() => setViewMode("horizontal")}
@@ -520,7 +630,52 @@ export default function App() {
               </div>
             </div>
 
-            {viewMode === "horizontal" ? (
+            {viewMode === "water3d" ? (
+              <>
+                <label>
+                  3D stack slices (count)
+                  <select value={String(stackSlices)} onChange={(e) => setStackSlices(Number(e.target.value))}>
+                    <option value="6">6</option>
+                    <option value="8">8</option>
+                    <option value="10">10</option>
+                    <option value="12">12</option>
+                    <option value="16">16</option>
+                  </select>
+                </label>
+                <label>
+                  Stack opacity
+                  <select value={String(stackOpacity)} onChange={(e) => setStackOpacity(Number(e.target.value))}>
+                    <option value="0.08">0.08</option>
+                    <option value="0.12">0.12</option>
+                    <option value="0.14">0.14</option>
+                    <option value="0.18">0.18</option>
+                    <option value="0.22">0.22</option>
+                  </select>
+                </label>
+                <label>
+                  Sea ice (SIarea)
+                  <select value={showSeaIce ? "on" : "off"} onChange={(e) => setShowSeaIce(e.target.value === "on")}>
+                    <option value="on">On</option>
+                    <option value="off">Off</option>
+                  </select>
+                </label>
+                {showSeaIce ? (
+                  <label>
+                    Sea ice opacity
+                    <select
+                      value={String(seaIceOpacity)}
+                      onChange={(e) => setSeaIceOpacity(Number(e.target.value))}
+                    >
+                      <option value="0.35">0.35</option>
+                      <option value="0.45">0.45</option>
+                      <option value="0.55">0.55</option>
+                      <option value="0.65">0.65</option>
+                      <option value="0.75">0.75</option>
+                    </select>
+                  </label>
+                ) : null}
+              </>
+            ) : viewMode === "horizontal" ? (
               <label>
                 Depth ({activeDepthLabel})
                 <input

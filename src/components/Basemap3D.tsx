@@ -2,7 +2,14 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { Layout, PlotData } from "plotly.js";
 import { withBase } from "../lib/paths";
 import { makeSyntheticGreenlandSeaBathy } from "../lib/syntheticBathy";
-import { paletteToColorscale, rdylbu_r_256, rgbKey, type RGB } from "../lib/colormap";
+import {
+  blues_r_256,
+  paletteToColorscale,
+  rdylbu_r_256,
+  rgbKey,
+  topo_256,
+  type RGB,
+} from "../lib/colormap";
 import {
   getPixelRGBA,
   loadImageData,
@@ -14,6 +21,7 @@ type BathyGrid = {
   lon: number[];
   lat: number[];
   z: number[][];
+  zRaw?: number[][]; // signed: land positive, ocean negative (when available)
 };
 
 type LonLatBounds = {
@@ -81,6 +89,9 @@ async function tryLoadBathyJson(): Promise<BathyGrid | null> {
       return null;
     }
 
+    // Normalize z into a numeric 2D array.
+    const zNumeric: number[][] = json.z.map((row) => (Array.isArray(row) ? row.map((v) => Number(v)) : []));
+
     // Determine sign convention robustly (avoid sampling bias: RTopo often has land in the top-left).
     // Conventions we support:
     // - ocean depth already negative (preferred): keep as-is
@@ -90,8 +101,8 @@ async function tryLoadBathyJson(): Promise<BathyGrid | null> {
     // - negative => ocean depth
     let hasNeg = false;
     let hasPos = false;
-    outer: for (let j = 0; j < json.z.length; j++) {
-      const row = json.z[j];
+    outer: for (let j = 0; j < zNumeric.length; j++) {
+      const row = zNumeric[j];
       if (!Array.isArray(row)) continue;
       for (let i = 0; i < row.length; i++) {
         const v = Number((row as any)[i]);
@@ -104,18 +115,20 @@ async function tryLoadBathyJson(): Promise<BathyGrid | null> {
 
     // If the grid has no negatives but has positives, treat it as "positive-down depth" and flip.
     if (!hasNeg && hasPos) {
-      json.z = json.z.map((row) => (Array.isArray(row) ? row.map((v) => -Number(v)) : row)) as any;
+      for (let j = 0; j < zNumeric.length; j++) {
+        const row = zNumeric[j];
+        for (let i = 0; i < row.length; i++) row[i] = -row[i];
+      }
       hasNeg = true;
       hasPos = false;
     }
 
-    // If we have both land (positive) and ocean (negative), clamp land to sea-level so depth scaling
-    // focuses on the ocean.
-    if (hasNeg) {
-      json.z = json.z.map((row) =>
-        Array.isArray(row) ? row.map((v) => Math.min(0, Number(v))) : row
-      ) as any;
-    }
+    // Keep signed z for coloring (land positive, ocean negative). For geometry, clamp land to 0
+    // so the z-axis focuses on ocean depth.
+    const zRaw = zNumeric;
+    const zGeom = zRaw.map((row) => row.map((v) => (Number.isFinite(v) ? Math.min(0, v) : v)));
+    json.zRaw = zRaw;
+    json.z = zGeom;
 
     // Plotly surface performance: keep grid under a manageable size.
     // RTopo can be thousands x thousands; downsample deterministically.
@@ -137,10 +150,14 @@ async function tryLoadBathyJson(): Promise<BathyGrid | null> {
       for (let i = 0; i < nLon; i += strideLon) lonIdx.push(i);
       if (lonIdx[lonIdx.length - 1] !== nLon - 1) lonIdx.push(nLon - 1);
 
+      const zRawDown = (json as any).zRaw
+        ? latIdx.map((j) => lonIdx.map((i) => Number((json as any).zRaw[j][i])))
+        : undefined;
       json = {
         lon: lonIdx.map((i) => Number(json!.lon[i])),
         lat: latIdx.map((j) => Number(json!.lat[j])),
         z: latIdx.map((j) => lonIdx.map((i) => Number((json!.z as any)[j][i]))),
+        zRaw: zRawDown,
       };
     }
 
@@ -168,6 +185,8 @@ export default function Basemap3D(props: {
     flipLat?: boolean;
   };
   horizontalField?: HorizontalField;
+  // Extra numeric planes (e.g., stacked depth slices, sea ice at z=0).
+  horizontalPlanes?: HorizontalField[];
   transectOverlay?: {
     enabled: boolean;
     imagePath: string;
@@ -338,6 +357,9 @@ export default function Basemap3D(props: {
   const colorscale332 = useMemo(() => makeDiscreteColorscale332(), []);
   const rdylbuPalette = useMemo<RGB[]>(() => rdylbu_r_256(), []);
   const rdylbuColorscale = useMemo(() => paletteToColorscale(rdylbuPalette), [rdylbuPalette]);
+  const bluesPalette = useMemo<RGB[]>(() => blues_r_256(), []);
+  const topoPalette = useMemo<RGB[]>(() => topo_256(), []);
+  const topoColorscale = useMemo(() => paletteToColorscale(topoPalette), [topoPalette]);
 
   function buildSstLookup(img: ImageData, vmin: number, vmax: number) {
     // Extract unique colors and order them along a reference RdYlBu_r palette
@@ -486,6 +508,17 @@ export default function Basemap3D(props: {
     return result;
   }, [bathy.lon, props.transectOverlay, transectImg]);
 
+  function fieldGridForPlane(field: HorizontalField) {
+    const fLat = field.lat;
+    const fLon = field.lon;
+    const nRows = field.values.length;
+    const nCols = field.values[0]?.length ?? 0;
+    if (Array.isArray(fLat) && Array.isArray(fLon) && fLat.length === nRows && fLon.length === nCols) {
+      return { x: fLon, y: fLat, values: field.values };
+    }
+    return { x: bathy.lon, y: bathy.lat, values: field.values };
+  }
+
   const data = useMemo<Partial<PlotData>[]>(() => {
     const numericH = props.horizontalField?.enabled ? props.horizontalField : null;
     const pngOverlayEnabled = Boolean(props.horizontalOverlay?.enabled && horizontalColor);
@@ -555,66 +588,187 @@ export default function Basemap3D(props: {
     const showContours = Boolean(props.showBathyContours);
     const traces: Partial<PlotData>[] = [];
 
-    traces.push({
-      type: "surface",
-      name: textureOnBathy ? "Bathy (textured)" : "Bathy",
-      x: bathy.lon,
-      y: bathy.lat,
-      z: bathy.z,
-      ...(textureOnBathy
-        ? {
-            surfacecolor: overlaySurfacecolor as any,
-            cmin: overlayCmin,
-            cmax: overlayCmax,
-            colorscale: overlayColorscale as any,
-            lighting: {
-              ambient: 0.95,
-              diffuse: 0.35,
-              specular: 0.05,
-              roughness: 0.95,
-            } as any,
+    if (textureOnBathy) {
+      traces.push({
+        type: "surface",
+        name: "Bathy (textured)",
+        x: bathy.lon,
+        y: bathy.lat,
+        z: bathy.z,
+        surfacecolor: overlaySurfacecolor as any,
+        cmin: overlayCmin,
+        cmax: overlayCmax,
+        colorscale: overlayColorscale as any,
+        lighting: {
+          ambient: 0.95,
+          diffuse: 0.35,
+          specular: 0.05,
+          roughness: 0.95,
+        } as any,
+        flatshading: true as any,
+        contours: {
+          z: {
+            show: showContours,
+            highlight: showContours,
+            usecolormap: false,
+            color: "rgba(255,255,255,0.10)",
+            highlightcolor: "limegreen",
+            project: { z: false },
+          },
+        } as any,
+        showscale: showOverlayScale,
+        ...(showOverlayScale
+          ? {
+              colorbar: {
+                title: { text: overlayColorbarTitle },
+                ...(overlayColorbarTicks
+                  ? { tickmode: "array", tickvals: overlayColorbarTicks }
+                  : null),
+                ticks: "outside",
+                len: 0.55,
+              } as any,
+            }
+          : null),
+        opacity: 1,
+      });
+    } else {
+      const zRaw = bathy.zRaw;
+      if (zRaw && zRaw.length === bathy.lat.length && zRaw[0]?.length === bathy.lon.length) {
+        const oceanLevels = [-4200, -3600, -3000, -2400, -1800, -1200, -600, -400, -200, -50]; // meters
+        const levels = [...oceanLevels].sort((a, b) => a - b);
+        const nBins = Math.max(2, levels.length - 1);
+        const denom = Math.max(1, nBins - 1);
+        const sampled = Array.from({ length: nBins }, (_, i) => {
+          const t = denom ? i / denom : 0;
+          const idx = Math.round(t * (bluesPalette.length - 1));
+          return bluesPalette[idx];
+        });
+        const toCss = (c: RGB) => `rgb(${c.r},${c.g},${c.b})`;
+        const oceanColorscale: Array<[number, string]> = [];
+        for (let i = 0; i < nBins; i++) {
+          const t0 = i / nBins;
+          const t1 = (i + 1) / nBins;
+          const color = toCss(sampled[i]);
+          oceanColorscale.push([t0, color], [t1, color]);
+        }
+        oceanColorscale[oceanColorscale.length - 1][0] = 1;
+
+        const zOcean: number[][] = new Array(bathy.lat.length);
+        const zLand: number[][] = new Array(bathy.lat.length);
+        const cLand: number[][] = new Array(bathy.lat.length);
+        let landMax = 0;
+        for (let j = 0; j < bathy.lat.length; j++) {
+          const oceanRow: number[] = new Array(bathy.lon.length);
+          const landRow: number[] = new Array(bathy.lon.length);
+          const cRow: number[] = new Array(bathy.lon.length);
+          for (let i = 0; i < bathy.lon.length; i++) {
+            const raw = Number(zRaw[j][i]);
+            if (!Number.isFinite(raw)) {
+              oceanRow[i] = Number.NaN;
+              landRow[i] = Number.NaN;
+              cRow[i] = Number.NaN;
+              continue;
+            }
+            if (raw < 0) {
+              oceanRow[i] = Number(bathy.z[j][i]);
+              landRow[i] = Number.NaN;
+              cRow[i] = Number.NaN;
+            } else if (raw > 0) {
+              oceanRow[i] = Number.NaN;
+              landRow[i] = 0;
+              cRow[i] = raw;
+              landMax = Math.max(landMax, raw);
+            } else {
+              oceanRow[i] = 0;
+              landRow[i] = Number.NaN;
+              cRow[i] = Number.NaN;
+            }
+          }
+          zOcean[j] = oceanRow;
+          zLand[j] = landRow;
+          cLand[j] = cRow;
+        }
+
+        traces.push({
+          type: "surface",
+          name: "Ocean bathymetry",
+          x: bathy.lon,
+          y: bathy.lat,
+          z: zOcean as any,
+          surfacecolor: zOcean as any,
+          cmin: levels[0],
+          cmax: levels[levels.length - 1],
+          colorscale: oceanColorscale as any,
+          showscale: false,
+          lighting: { ambient: 0.85, diffuse: 0.35, specular: 0.05, roughness: 0.95 } as any,
+          flatshading: true as any,
+          contours: {
+            z: {
+              show: showContours,
+              highlight: showContours,
+              usecolormap: false,
+              color: "rgba(255,255,255,0.10)",
+              highlightcolor: "limegreen",
+              project: { z: false },
+            },
+          } as any,
+          opacity: 1,
+        });
+
+        // Land as a sea-level "cap" with topo coloring.
+        if (landMax > 0) {
+          traces.push({
+            type: "surface",
+            name: "Land (sea-level cap)",
+            x: bathy.lon,
+            y: bathy.lat,
+            z: zLand as any,
+            surfacecolor: cLand as any,
+            cmin: 0,
+            cmax: landMax,
+            colorscale: topoColorscale as any,
+            showscale: false,
+            lighting: { ambient: 0.95, diffuse: 0.2, specular: 0.0, roughness: 1.0 } as any,
             flatshading: true as any,
-          }
-        : {
-            colorscale: [
-              [0.0, "#06162a"],
-              [0.2, "#0b2b4a"],
-              [0.45, "#124f6a"],
-              [0.7, "#2f7e74"],
-              [1.0, "#a0c7a0"],
-            ],
-            lighting: {
-              ambient: 0.8,
-              diffuse: 0.35,
-              specular: 0.05,
-              roughness: 0.95,
-            } as any,
-          }),
-      contours: {
-        z: {
-          show: showContours,
-          highlight: showContours,
-          usecolormap: false,
-          color: "rgba(255,255,255,0.10)",
-          highlightcolor: "limegreen",
-          project: { z: false },
-        },
-      } as any,
-      showscale: textureOnBathy ? showOverlayScale : false,
-      ...(textureOnBathy && showOverlayScale
-        ? {
-            colorbar: {
-              title: { text: overlayColorbarTitle },
-              ...(overlayColorbarTicks
-                ? { tickmode: "array", tickvals: overlayColorbarTicks }
-                : null),
-              ticks: "outside",
-              len: 0.55,
-            } as any,
-          }
-        : null),
-      opacity: 1,
-    });
+            hoverinfo: "skip",
+            opacity: 1,
+          });
+        }
+      } else {
+        traces.push({
+          type: "surface",
+          name: "Bathy",
+          x: bathy.lon,
+          y: bathy.lat,
+          z: bathy.z,
+          colorscale: [
+            [0.0, "#06162a"],
+            [0.2, "#0b2b4a"],
+            [0.45, "#124f6a"],
+            [0.7, "#2f7e74"],
+            [1.0, "#a0c7a0"],
+          ],
+          lighting: {
+            ambient: 0.8,
+            diffuse: 0.35,
+            specular: 0.05,
+            roughness: 0.95,
+          } as any,
+          contours: {
+            z: {
+              show: showContours,
+              highlight: showContours,
+              usecolormap: false,
+              color: "rgba(255,255,255,0.10)",
+              highlightcolor: "limegreen",
+              project: { z: false },
+            },
+          } as any,
+          showscale: false,
+          opacity: 1,
+        });
+      }
+    }
 
     if (
       overlayEnabled &&
@@ -664,6 +818,43 @@ export default function Basemap3D(props: {
             }
           : null),
         opacity: overlayOpacity,
+        lighting: { ambient: 1.0, diffuse: 0.15, specular: 0.0, roughness: 1.0 } as any,
+        flatshading: true as any,
+        hoverinfo: "skip",
+      });
+    }
+
+    // Extra planes (stacked depth slices, sea ice concentration, etc).
+    const planes = (props.horizontalPlanes ?? []).filter((p) => p?.enabled);
+    for (let idx = 0; idx < planes.length; idx++) {
+      const p = planes[idx];
+      const { x, y, values } = fieldGridForPlane(p);
+      const zPlane = p.zPlane ?? 0;
+      const zSheet = y.map(() => x.map(() => zPlane));
+      const opacity = p.opacity ?? 0.25;
+      const showScale = Boolean(p.showScale);
+      traces.push({
+        type: "surface",
+        name: `Plane ${idx + 1}`,
+        x,
+        y,
+        z: zSheet as any,
+        surfacecolor: values as any,
+        cmin: p.cmin,
+        cmax: p.cmax,
+        colorscale: p.colorscale as any,
+        showscale: showScale,
+        ...(showScale
+          ? {
+              colorbar: {
+                title: { text: p.colorbarTitle ?? "Value" },
+                ...(p.colorbarTicks ? { tickmode: "array", tickvals: p.colorbarTicks } : null),
+                ticks: "outside",
+                len: 0.55,
+              } as any,
+            }
+          : null),
+        opacity,
         lighting: { ambient: 1.0, diffuse: 0.15, specular: 0.0, roughness: 1.0 } as any,
         flatshading: true as any,
         hoverinfo: "skip",
