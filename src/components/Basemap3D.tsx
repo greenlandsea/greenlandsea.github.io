@@ -59,6 +59,7 @@ type HorizontalField = {
   colorbarLen?: number;
   colorbarX?: number;
   colorbarY?: number;
+  hoverSkip?: boolean;
   bounds?: LonLatBounds;
   // Treat exact zero as missing (useful for some salinity exports with 0 fill over land).
   zeroAsMissing?: boolean;
@@ -82,6 +83,28 @@ type TransectField = {
   colorbarLen?: number;
   colorbarX?: number;
   colorbarY?: number;
+};
+
+type WindLayer = {
+  enabled: boolean;
+  lon: number[];
+  lat: number[];
+  u: number[][];
+  v: number[][];
+  zPlane?: number;
+  particleCount?: number;
+  speed?: number;
+  color?: string;
+  size?: number;
+};
+
+type WindParticle = {
+  x: number;
+  y: number;
+  ttl: number;
+  speedMag: number;
+  trailX: number[];
+  trailY: number[];
 };
 
 async function tryLoadBathyJson(
@@ -219,6 +242,16 @@ const DEFAULT_SCENE_CAMERA = {
 };
 
 const SCENE_CAMERA_STORAGE_KEY = "gs_scene_camera_v1";
+const WIND_TRACE_NAME = "Wind particles";
+const WIND_TRACE_COLORS = [
+  "rgba(44,123,182,0.90)",
+  "rgba(0,166,202,0.90)",
+  "rgba(144,235,157,0.90)",
+  "rgba(249,208,87,0.90)",
+  "rgba(242,158,46,0.90)",
+  "rgba(231,104,24,0.90)",
+];
+const WIND_TRACE_NAMES = WIND_TRACE_COLORS.map((_, i) => `${WIND_TRACE_NAME}-${i}`);
 
 function normalizeCamera(input: any): any | null {
   if (!input || typeof input !== "object") return null;
@@ -279,6 +312,7 @@ export default function Basemap3D(props: {
     opacity?: number;
   };
   transectField?: TransectField;
+  windLayer?: WindLayer;
   onStatusChange?: (status: {
     plotly: "loading" | "ready" | "failed";
     bathy: "loading" | "file" | "synthetic";
@@ -298,8 +332,13 @@ export default function Basemap3D(props: {
   const didInitCameraRef = useRef(false);
   const graphDivRef = useRef<any | null>(null);
   const lastSavedCameraJsonRef = useRef<string | null>(null);
+  const lastKnownCameraRef = useRef<any | null>(null);
   const saveRafRef = useRef<number | null>(null);
   const initialCameraRef = useRef<any | null>(null);
+  const windParticlesRef = useRef<WindParticle[]>([]);
+  const windAnimRafRef = useRef<number | null>(null);
+  const windLastTsRef = useRef(0);
+  const windLastDrawTsRef = useRef(0);
   const [plotStatus, setPlotStatus] = useState<"loading" | "ready" | "failed">(
     "loading"
   );
@@ -458,6 +497,19 @@ export default function Basemap3D(props: {
   }, [bathyStatus, horizontalImgStatus, plotStatus, props.onStatusChange, transectImgStatus]);
 
   const bathy = useMemo(() => grid ?? makeSyntheticGreenlandSeaBathy(), [grid]);
+  const bathyHasOceanNeg = useMemo(() => {
+    const zRaw = (grid as any)?.zRaw as number[][] | undefined;
+    if (!zRaw) return false;
+    for (let j = 0; j < zRaw.length; j++) {
+      const row = zRaw[j];
+      if (!Array.isArray(row)) continue;
+      for (let i = 0; i < row.length; i++) {
+        const v = Number(row[i]);
+        if (Number.isFinite(v) && v < -0.5) return true; // allow small noise near 0
+      }
+    }
+    return false;
+  }, [grid]);
 
   const colorscale332 = useMemo(() => makeDiscreteColorscale332(), []);
   const rdylbuPalette = useMemo<RGB[]>(() => rdylbu_r_256(), []);
@@ -489,6 +541,233 @@ export default function Basemap3D(props: {
     },
     [depthWarp.deepRatio, depthWarp.focusDepthM, depthWarp.mode]
   );
+
+  useEffect(() => {
+    if (windAnimRafRef.current != null) {
+      window.cancelAnimationFrame(windAnimRafRef.current);
+      windAnimRafRef.current = null;
+    }
+    windParticlesRef.current = [];
+    windLastTsRef.current = 0;
+    windLastDrawTsRef.current = 0;
+
+    const layer = props.windLayer;
+    if (!layer?.enabled) return;
+    const lon = layer.lon ?? [];
+    const lat = layer.lat ?? [];
+    const u = layer.u ?? [];
+    const v = layer.v ?? [];
+    const nx = lon.length;
+    const ny = lat.length;
+    if (!nx || !ny) return;
+    if (u.length !== ny || v.length !== ny) return;
+    if ((u[0]?.length ?? 0) !== nx || (v[0]?.length ?? 0) !== nx) return;
+
+    const lonStart = Number(lon[0]);
+    const lonEnd = Number(lon[nx - 1]);
+    const latStart = Number(lat[0]);
+    const latEnd = Number(lat[ny - 1]);
+    const lonMin = Math.min(lonStart, lonEnd);
+    const lonMax = Math.max(lonStart, lonEnd);
+    const latMin = Math.min(latStart, latEnd);
+    const latMax = Math.max(latStart, latEnd);
+    const lonSpan = Math.max(1e-9, lonMax - lonMin);
+    const latSpan = Math.max(1e-9, latMax - latMin);
+    const lonAsc = lonEnd >= lonStart;
+    const latAsc = latEnd >= latStart;
+
+    const toLonCoord = (x: number) => {
+      const t = (x - lonMin) / lonSpan;
+      const c = t * (nx - 1);
+      return lonAsc ? c : nx - 1 - c;
+    };
+    const toLatCoord = (y: number) => {
+      const t = (y - latMin) / latSpan;
+      const c = t * (ny - 1);
+      return latAsc ? c : ny - 1 - c;
+    };
+
+    const sample = (x: number, y: number) => {
+      if (x < lonMin || x > lonMax || y < latMin || y > latMax) return null;
+      const cx = toLonCoord(x);
+      const cy = toLatCoord(y);
+      const i0 = Math.max(0, Math.min(nx - 1, Math.floor(cx)));
+      const j0 = Math.max(0, Math.min(ny - 1, Math.floor(cy)));
+      const i1 = Math.min(nx - 1, i0 + 1);
+      const j1 = Math.min(ny - 1, j0 + 1);
+      const fx = Math.max(0, Math.min(1, cx - i0));
+      const fy = Math.max(0, Math.min(1, cy - j0));
+
+      const corners = [
+        { i: i0, j: j0, w: (1 - fx) * (1 - fy) },
+        { i: i1, j: j0, w: fx * (1 - fy) },
+        { i: i0, j: j1, w: (1 - fx) * fy },
+        { i: i1, j: j1, w: fx * fy },
+      ];
+
+      let sumW = 0;
+      let sumU = 0;
+      let sumV = 0;
+      for (const c of corners) {
+        const uu = Number(u[c.j]?.[c.i]);
+        const vv = Number(v[c.j]?.[c.i]);
+        if (!Number.isFinite(uu) || !Number.isFinite(vv)) continue;
+        sumW += c.w;
+        sumU += uu * c.w;
+        sumV += vv * c.w;
+      }
+      if (sumW <= 1e-8) return null;
+      return { uu: sumU / sumW, vv: sumV / sumW };
+    };
+
+    let maxMag = 0;
+    for (let j = 0; j < ny; j++) {
+      const ur = u[j];
+      const vr = v[j];
+      if (!Array.isArray(ur) || !Array.isArray(vr)) continue;
+      for (let i = 0; i < nx; i++) {
+        const uu = Number(ur[i]);
+        const vv = Number(vr[i]);
+        if (!Number.isFinite(uu) || !Number.isFinite(vv)) continue;
+        const m = Math.hypot(uu, vv);
+        if (m > maxMag) maxMag = m;
+      }
+    }
+    const targetDegPerSec = 0.9 * Math.max(0.1, Number(layer.speed ?? 1));
+    const advectScale = maxMag > 1e-6 ? Math.min(120, targetDegPerSec / maxMag) : 0;
+    const nParticles = Math.max(96, Math.min(1200, Math.round(Number(layer.particleCount ?? 520))));
+    const trailLen = Math.max(6, Math.min(22, Math.round((layer.size ?? 1.4) * 7)));
+
+    const spawn = (): WindParticle => {
+      for (let k = 0; k < 60; k++) {
+        const x = lonMin + Math.random() * lonSpan;
+        const y = latMin + Math.random() * latSpan;
+        const w = sample(x, y);
+        if (!w) continue;
+        const speedMag = Math.hypot(w.uu, w.vv);
+        if (speedMag <= 1e-8) continue;
+        return { x, y, ttl: 2 + Math.random() * 6, speedMag, trailX: [x], trailY: [y] };
+      }
+      const x = (lonMin + lonMax) * 0.5;
+      const y = (latMin + latMax) * 0.5;
+      return { x, y, ttl: 2 + Math.random() * 6, speedMag: 0, trailX: [x], trailY: [y] };
+    };
+
+    const particles = Array.from({ length: nParticles }, () => spawn());
+    windParticlesRef.current = particles;
+    const xBins = WIND_TRACE_NAMES.map(() => [] as number[]);
+    const yBins = WIND_TRACE_NAMES.map(() => [] as number[]);
+    const zBins = WIND_TRACE_NAMES.map(() => [] as number[]);
+    let traceIndices: number[] | null = null;
+
+    const draw = () => {
+      const Plotly = plotlyLibRef.current;
+      const graphDiv = graphDivRef.current;
+      if (!Plotly || !graphDiv) return;
+      if (!traceIndices || traceIndices.some((idx) => idx < 0)) {
+        const traces = (graphDiv.data ?? []) as Array<{ name?: string }>;
+        traceIndices = WIND_TRACE_NAMES.map((name) => traces.findIndex((t) => t?.name === name));
+      }
+      if (!traceIndices || traceIndices.some((idx) => idx < 0)) return;
+      const zVal = scaleZ(layer.zPlane ?? 6);
+      for (let b = 0; b < WIND_TRACE_NAMES.length; b++) {
+        xBins[b].length = 0;
+        yBins[b].length = 0;
+        zBins[b].length = 0;
+      }
+
+      for (const p of particles) {
+        if (p.trailX.length < 2) continue;
+        const speedNorm = maxMag > 1e-6 ? Math.max(0, Math.min(0.999, p.speedMag / maxMag)) : 0;
+        const bin = Math.min(WIND_TRACE_NAMES.length - 1, Math.floor(speedNorm * WIND_TRACE_NAMES.length));
+        const xb = xBins[bin];
+        const yb = yBins[bin];
+        const zb = zBins[bin];
+        for (let k = 0; k < p.trailX.length; k++) {
+          xb.push(p.trailX[k]);
+          yb.push(p.trailY[k]);
+          zb.push(zVal);
+        }
+        xb.push(Number.NaN);
+        yb.push(Number.NaN);
+        zb.push(Number.NaN);
+      }
+
+      for (let b = 0; b < WIND_TRACE_NAMES.length; b++) {
+        if (!xBins[b].length) {
+          xBins[b].push(Number.NaN);
+          yBins[b].push(Number.NaN);
+          zBins[b].push(Number.NaN);
+        }
+      }
+
+      void Plotly.restyle(
+        graphDiv,
+        {
+          x: xBins,
+          y: yBins,
+          z: zBins,
+        },
+        traceIndices as any
+      );
+    };
+
+    draw();
+
+    const tick = (ts: number) => {
+      const dtRaw = windLastTsRef.current ? (ts - windLastTsRef.current) / 1000 : 1 / 60;
+      windLastTsRef.current = ts;
+      const dt = Math.max(0.001, Math.min(0.1, dtRaw));
+
+      for (let idx = 0; idx < particles.length; idx++) {
+        const p = particles[idx];
+        if (p.ttl <= 0) {
+          particles[idx] = spawn();
+          continue;
+        }
+        const w = sample(p.x, p.y);
+        if (!w) {
+          particles[idx] = spawn();
+          continue;
+        }
+        const k = advectScale * dt;
+        const midX = p.x + w.uu * k * 0.5;
+        const midY = p.y + w.vv * k * 0.5;
+        const wMid = sample(midX, midY) ?? w;
+        p.speedMag = Math.hypot(wMid.uu, wMid.vv);
+        p.x += wMid.uu * k;
+        p.y += wMid.vv * k;
+        p.ttl -= dt;
+        p.trailX.push(p.x);
+        p.trailY.push(p.y);
+        if (p.trailX.length > trailLen) {
+          const drop = p.trailX.length - trailLen;
+          p.trailX.splice(0, drop);
+          p.trailY.splice(0, drop);
+        }
+        if (p.x < lonMin || p.x > lonMax || p.y < latMin || p.y > latMax) {
+          particles[idx] = spawn();
+        }
+      }
+
+      if (ts - windLastDrawTsRef.current >= 36) {
+        windLastDrawTsRef.current = ts;
+        draw();
+      }
+      windAnimRafRef.current = window.requestAnimationFrame(tick);
+    };
+
+    windAnimRafRef.current = window.requestAnimationFrame(tick);
+    return () => {
+      if (windAnimRafRef.current != null) {
+        window.cancelAnimationFrame(windAnimRafRef.current);
+        windAnimRafRef.current = null;
+      }
+      windParticlesRef.current = [];
+      windLastTsRef.current = 0;
+      windLastDrawTsRef.current = 0;
+    };
+  }, [props.windLayer, scaleZ]);
 
   const bathyZPlot = useMemo(() => {
     // Apply non-linear depth scaling to the geometry only.
@@ -571,7 +850,7 @@ export default function Basemap3D(props: {
     if (lonSpan === 0 || latSpan === 0) return null;
 
     const vmin = overlay.valueRange?.min ?? -1;
-    const vmax = overlay.valueRange?.max ?? 5;
+    const vmax = overlay.valueRange?.max ?? 8;
     const sstLookup =
       overlay.colormap === "rdylbu_r" ? buildSstLookup(horizontalImg, vmin, vmax) : null;
 
@@ -1039,8 +1318,11 @@ export default function Basemap3D(props: {
           if (!Number.isFinite(val)) return Number.NaN;
           if (plane.zeroAsMissing && val === 0) return Number.NaN;
 
-          // Hide overlay on dry cells (nearest bathy depth at/above sea level).
-          if (lonMap && latMap) {
+          // For fields where 0 can be physically valid (e.g., temperature), only treat
+          // exact-zero values as potential fill and mask them on dry cells. Do not mask
+          // non-zero values with bathymetry to avoid coastal false positives.
+          const maybeFill = val === 0;
+          if (bathyHasOceanNeg && maybeFill && lonMap && latMap) {
             const jj = latMap[j];
             const ii = lonMap[i];
             const depth = Number(bathy.z[jj]?.[ii]);
@@ -1062,6 +1344,32 @@ export default function Basemap3D(props: {
           return val;
         })
       );
+      const hoverValues: number[][] = valuesMasked.map((row, j) =>
+        row.map((masked, i) => {
+          if (Number.isFinite(masked)) return masked;
+          const raw = Number(plane.values?.[j]?.[i]);
+          if (!Number.isFinite(raw)) return Number.NaN;
+          // Keep land masked in hover readout, but avoid NaN in ocean where the
+          // visualized field is valid.
+          if (lonMap && latMap) {
+            const jj = latMap[j];
+            const ii = lonMap[i];
+            const depth = Number(bathy.z[jj]?.[ii]);
+            if (Number.isFinite(depth) && depth >= -1e-6) return Number.NaN;
+          }
+          return raw;
+        })
+      );
+      const hoverText: string[][] = hoverValues.map((row, j) =>
+        row.map((v, i) => {
+          const valueText = Number.isFinite(v) ? Number(v).toFixed(3) : "n/a";
+          return (
+            `Lon ${Number(plane.x[i]).toFixed(2)}°<br>` +
+            `Lat ${Number(plane.y[j]).toFixed(2)}°<br>` +
+            `${overlayColorbarTitle}: ${valueText}`
+          );
+        })
+      );
 
       const zSheet = valuesMasked.map((row) =>
         row.map((val) => {
@@ -1079,7 +1387,7 @@ export default function Basemap3D(props: {
         y: plane.y,
         z: zSheet,
         surfacecolor: valuesMasked as any,
-        text: valuesMasked as any,
+        hovertext: hoverText as any,
         cmin: overlayCmin,
         cmax: overlayCmax,
         colorscale: overlayColorscale as any,
@@ -1092,7 +1400,9 @@ export default function Basemap3D(props: {
                   ? { tickmode: "array", tickvals: overlayColorbarTicks }
                   : null),
                 ticks: "outside",
-                len: 0.55,
+                len: overlayColorbarLen ?? 0.55,
+                ...(Number.isFinite(overlayColorbarX) ? { x: overlayColorbarX } : null),
+                ...(Number.isFinite(overlayColorbarY) ? { y: overlayColorbarY } : null),
               } as any,
             }
           : null),
@@ -1116,11 +1426,7 @@ export default function Basemap3D(props: {
               } as any,
             }
           : null),
-        hovertemplate:
-          `Lon %{x:.2f}°<br>` +
-          `Lat %{y:.2f}°<br>` +
-          `${overlayColorbarTitle}: %{text:.3f}` +
-          `<extra></extra>`,
+        hoverinfo: "text",
       });
     }
 
@@ -1139,6 +1445,17 @@ export default function Basemap3D(props: {
       );
       const opacity = p.opacity ?? 0.25;
       const showScale = Boolean(p.showScale);
+      const hoverText: string[][] = values.map((row, j) =>
+        row.map((v, i) => {
+          const n = Number(v);
+          const valueText = Number.isFinite(n) ? n.toFixed(3) : "n/a";
+          return (
+            `Lon ${Number(x[i]).toFixed(2)}°<br>` +
+            `Lat ${Number(y[j]).toFixed(2)}°<br>` +
+            `${p.colorbarTitle ?? "Value"}: ${valueText}`
+          );
+        })
+      );
       traces.push({
         type: "surface",
         name: `Plane ${idx + 1}`,
@@ -1146,7 +1463,7 @@ export default function Basemap3D(props: {
         y,
         z: zSheet as any,
         surfacecolor: values as any,
-        text: values as any,
+        hovertext: hoverText as any,
         cmin: p.cmin,
         cmax: p.cmax,
         colorscale: p.colorscale as any,
@@ -1166,18 +1483,50 @@ export default function Basemap3D(props: {
         opacity,
         lighting: { ambient: 1.0, diffuse: 0.15, specular: 0.0, roughness: 1.0 } as any,
         flatshading: true as any,
-        hovertemplate:
-          `Lon %{x:.2f}°<br>` +
-          `Lat %{y:.2f}°<br>` +
-          `${p.colorbarTitle ?? "Value"}: %{text:.3f}` +
-          `<extra></extra>`,
+        ...(p.hoverSkip
+          ? { hoverinfo: "skip" as const }
+          : {
+              hoverinfo: "text" as const,
+            }),
       });
+    }
+
+    if (props.windLayer?.enabled) {
+      const zSeed = [scaleZ(props.windLayer.zPlane ?? 6), Number.NaN];
+      for (let b = 0; b < WIND_TRACE_NAMES.length; b++) {
+        traces.push({
+          type: "scatter3d",
+          name: WIND_TRACE_NAMES[b],
+          mode: "lines",
+          x: [Number.NaN, Number.NaN] as any,
+          y: [Number.NaN, Number.NaN] as any,
+          z: zSeed as any,
+          line: {
+            width: Math.max(0.8, Number(props.windLayer.size ?? 1.7) * 0.95),
+            color: WIND_TRACE_COLORS[b],
+          } as any,
+          opacity: 0.95,
+          hoverinfo: "skip",
+          showlegend: false,
+        });
+      }
     }
 
     const numericT = props.transectField?.enabled ? props.transectField : null;
     if (numericT) {
       const zScaled = numericT.z.map((zv) => scaleZ(zv));
       const zCurtain = zScaled.map((zv) => numericT.lon.map(() => zv));
+      const transectHoverText = numericT.values.map((row, j) =>
+        row.map((val, i) => {
+          const n = Number(val);
+          const vText = Number.isFinite(n) ? n.toFixed(3) : "n/a";
+          return (
+            `Lon ${Number(numericT.lon[i]).toFixed(2)}°<br>` +
+            `Depth ${Number(numericT.z[j]).toFixed(0)} m<br>` +
+            `${numericT.colorbarTitle ?? "Value"}: ${vText}`
+          );
+        })
+      );
       const opacity = numericT.opacity ?? 0.9;
       traces.push({
         type: "surface",
@@ -1186,7 +1535,7 @@ export default function Basemap3D(props: {
         y: numericT.z.map(() => numericT.lat),
         z: zCurtain as any,
         surfacecolor: numericT.values as any,
-        text: numericT.values as any,
+        hovertext: transectHoverText as any,
         cmin: numericT.cmin,
         cmax: numericT.cmax,
         colorscale: numericT.colorscale as any,
@@ -1206,12 +1555,7 @@ export default function Basemap3D(props: {
             }
           : null),
         opacity,
-        hovertemplate:
-          `Lon %{x:.2f}°<br>` +
-          `Depth %{customdata:.0f} m<br>` +
-          `${numericT.colorbarTitle ?? "Value"}: %{text:.3f}` +
-          `<extra></extra>`,
-        customdata: numericT.z.map((zv) => numericT.lon.map(() => zv)) as any,
+        hoverinfo: "text",
       });
     } else if (props.transectOverlay?.enabled && transectCurtain) {
       const opacity = props.transectOverlay.opacity ?? 0.9;
@@ -1246,6 +1590,7 @@ export default function Basemap3D(props: {
     props.transectField,
     props.transectOverlay?.enabled,
     props.transectOverlay?.opacity,
+    props.windLayer,
     props.showBathyContours,
     props.showFieldContours,
     scaleZ,
@@ -1340,6 +1685,7 @@ export default function Basemap3D(props: {
     // Set a good initial view once; after that, user interactions are preserved via uirevision.
     try {
       const cam = initialCameraRef.current ?? DEFAULT_SCENE_CAMERA;
+      lastKnownCameraRef.current = cam;
       void Plotly.relayout(graphDiv, { "scene.camera": cam });
       // Persist the initial camera once so revisiting the page keeps the same view,
       // even if the user doesn't touch the scene.
@@ -1362,6 +1708,7 @@ export default function Basemap3D(props: {
     try {
       const cam = DEFAULT_SCENE_CAMERA;
       initialCameraRef.current = cam;
+      lastKnownCameraRef.current = cam;
       lastSavedCameraJsonRef.current = null;
       void Plotly.relayout(graphDiv, { "scene.camera": cam });
       try {
@@ -1381,6 +1728,7 @@ export default function Basemap3D(props: {
     // Try to read the full current camera from graphDiv (more robust than piecing from relayout keys).
     const cam = normalizeCamera(graphDiv?.layout?.scene?.camera);
     if (!cam) return;
+    lastKnownCameraRef.current = cam;
 
     // Debounce writes to localStorage to avoid excessive churn while orbiting.
     if (saveRafRef.current != null) window.cancelAnimationFrame(saveRafRef.current);
@@ -1396,6 +1744,27 @@ export default function Basemap3D(props: {
       }
     });
   }, []);
+
+  useEffect(() => {
+    // Keep the current camera orientation while changing depth ratio.
+    const Plotly = plotlyLibRef.current;
+    const graphDiv = graphDivRef.current;
+    if (!Plotly || !graphDiv || !didInitCameraRef.current) return;
+    const cam = normalizeCamera(graphDiv?.layout?.scene?.camera) ?? lastKnownCameraRef.current;
+    if (!cam) return;
+    lastKnownCameraRef.current = cam;
+    let raf = window.requestAnimationFrame(() => {
+      raf = 0;
+      try {
+        void Plotly.relayout(graphDiv, { "scene.camera": cam });
+      } catch {
+        // ignore
+      }
+    });
+    return () => {
+      if (raf) window.cancelAnimationFrame(raf);
+    };
+  }, [depthRatio]);
 
   if (!Plot) {
     return (

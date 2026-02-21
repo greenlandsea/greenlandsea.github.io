@@ -5,6 +5,7 @@ import {
   loadGsZarrMeta,
   loadHorizontalSlice,
   loadSeaIce2D,
+  loadWindStress2D,
   loadTransectSlice,
   nearestIndex,
   type GsZarrMeta,
@@ -22,12 +23,37 @@ type VarColorSettings = {
   levels: number; // used when mode === "discrete"
 };
 
+type HorizontalGrid = {
+  values: number[][];
+  lon: number[];
+  lat: number[];
+};
+
+type TransectGrid = {
+  values: number[][];
+  lon: number[];
+  z: number[];
+};
+
+type VectorGrid = {
+  u: number[][];
+  v: number[][];
+  lon: number[];
+  lat: number[];
+};
+
+const PLAYBACK_SURFACE_MAX = 180;
+const PLAYBACK_TRANSECT_LON_MAX = 220;
+const PLAYBACK_TRANSECT_DEPTH_MAX = 110;
+const PLAYBACK_SEA_ICE_MAX = 150;
+const PLAYBACK_WIND_MAX = 110;
+
 function clamp(n: number, min: number, max: number) {
   return Math.min(Math.max(n, min), max);
 }
 
 function defaultRange(varId: VarId) {
-  if (varId === "T") return { min: -1, max: 5, ticks: [-1, 0, 1, 2, 3, 4, 5], title: "Temperature (°C)" };
+  if (varId === "T") return { min: -1, max: 8, ticks: [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8], title: "Temperature (°C)" };
   return { min: 32, max: 36, ticks: [32, 33, 34, 35, 36], title: "Salinity (g/kg)" };
 }
 
@@ -35,9 +61,13 @@ const RDYLBU_PALETTE = rdylbu_r_256();
 const RDYLBU_CONTINUOUS = paletteToColorscale(RDYLBU_PALETTE);
 
 const DEFAULT_COLOR_SETTINGS: Record<VarId, VarColorSettings> = {
-  T: { cmin: -1, cmax: 5, tickCount: 7, mode: "continuous", levels: 12 },
+  T: { cmin: -1, cmax: 8, tickCount: 10, mode: "continuous", levels: 12 },
   S: { cmin: 32, cmax: 36, tickCount: 5, mode: "continuous", levels: 12 },
 };
+
+const SEA_ICE_THRESHOLD = 0.3;
+const SEA_ICE_HEIGHT_M = 5;
+const SEA_ICE_OPACITY = 0.55;
 
 function makeTicks(min: number, max: number, tickCount: number) {
   if (!Number.isFinite(min) || !Number.isFinite(max)) return undefined;
@@ -61,6 +91,100 @@ function computeMinMax(values: number[][]) {
   }
   if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
   return { min, max };
+}
+
+function sampleIndices(length: number, targetCount: number) {
+  if (!Number.isFinite(length) || length <= 0) return [];
+  if (!Number.isFinite(targetCount) || targetCount <= 0 || targetCount >= length) {
+    return Array.from({ length }, (_, i) => i);
+  }
+  const n = Math.max(2, Math.min(length, Math.round(targetCount)));
+  if (n >= length) return Array.from({ length }, (_, i) => i);
+
+  const out: number[] = [];
+  const step = (length - 1) / (n - 1);
+  let prev = -1;
+  for (let k = 0; k < n; k++) {
+    const idx = Math.round(k * step);
+    if (idx !== prev) {
+      out.push(idx);
+      prev = idx;
+    }
+  }
+  if (out[0] !== 0) out.unshift(0);
+  if (out[out.length - 1] !== length - 1) out.push(length - 1);
+  return out;
+}
+
+function downsampleRowsCols(values: number[][], rowIndices: number[], colIndices: number[]) {
+  return rowIndices.map((j) => {
+    const src = values[j] ?? [];
+    return colIndices.map((i) => Number(src[i]));
+  });
+}
+
+function downsampleHorizontalGrid(
+  values: number[][],
+  lon: number[],
+  lat: number[],
+  maxLon: number,
+  maxLat: number
+): HorizontalGrid {
+  if (!values.length || !values[0]?.length || !lon.length || !lat.length) return { values, lon, lat };
+  if (lon.length <= maxLon && lat.length <= maxLat) return { values, lon, lat };
+  const lonIdx = sampleIndices(lon.length, maxLon);
+  const latIdx = sampleIndices(lat.length, maxLat);
+  return {
+    lon: lonIdx.map((i) => lon[i]),
+    lat: latIdx.map((j) => lat[j]),
+    values: downsampleRowsCols(values, latIdx, lonIdx),
+  };
+}
+
+function downsampleTransectGrid(
+  values: number[][],
+  lon: number[],
+  z: number[],
+  maxLon: number,
+  maxDepth: number
+): TransectGrid {
+  if (!values.length || !values[0]?.length || !lon.length || !z.length) return { values, lon, z };
+  if (lon.length <= maxLon && z.length <= maxDepth) return { values, lon, z };
+  const lonIdx = sampleIndices(lon.length, maxLon);
+  const zIdx = sampleIndices(z.length, maxDepth);
+  return {
+    lon: lonIdx.map((i) => lon[i]),
+    z: zIdx.map((j) => z[j]),
+    values: downsampleRowsCols(values, zIdx, lonIdx),
+  };
+}
+
+function downsampleVectorGrid(
+  u: number[][],
+  v: number[][],
+  lon: number[],
+  lat: number[],
+  maxLon: number,
+  maxLat: number
+): VectorGrid {
+  if (!u.length || !u[0]?.length || !v.length || !v[0]?.length || !lon.length || !lat.length) {
+    return { u, v, lon, lat };
+  }
+  if (lon.length <= maxLon && lat.length <= maxLat) return { u, v, lon, lat };
+  const lonIdx = sampleIndices(lon.length, maxLon);
+  const latIdx = sampleIndices(lat.length, maxLat);
+  return {
+    lon: lonIdx.map((i) => lon[i]),
+    lat: latIdx.map((j) => lat[j]),
+    u: latIdx.map((j) => {
+      const row = u[j] ?? [];
+      return lonIdx.map((i) => Number(row[i]));
+    }),
+    v: latIdx.map((j) => {
+      const row = v[j] ?? [];
+      return lonIdx.map((i) => Number(row[i]));
+    }),
+  };
 }
 
 function makeDiscreteColorscale(levels: number) {
@@ -110,16 +234,17 @@ function ToggleSwitch(props: {
 export default function App() {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const [cameraResetNonce, setCameraResetNonce] = useState(0);
-  const [panelOpen, setPanelOpen] = useState(() => {
+  const [panelOpen, setPanelOpen] = useState(true);
+  const [panelPos, setPanelPos] = useState<{ left: number; top: number } | null>(null);
+  const [themeMode, setThemeMode] = useState<"night" | "day">(() => {
     try {
-      const v = window.localStorage.getItem("gs_panel_open");
-      if (v != null) return v === "1";
+      const saved = window.localStorage.getItem("gs_theme_mode");
+      if (saved === "day" || saved === "night") return saved;
     } catch {
       // ignore
     }
-    return false;
+    return "night";
   });
-  const [panelPos, setPanelPos] = useState<{ left: number; top: number } | null>(null);
 
   useEffect(() => {
     try {
@@ -129,27 +254,32 @@ export default function App() {
     }
   }, [panelOpen]);
 
+  useEffect(() => {
+    try {
+      document.body.setAttribute("data-theme", themeMode);
+      window.localStorage.setItem("gs_theme_mode", themeMode);
+    } catch {
+      // ignore
+    }
+  }, [themeMode]);
+
   const [viewMode, setViewMode] = useState<ViewMode>("horizontal");
   const [varId, setVarId] = useState<VarId>("T");
   const projectOn3d = true;
   const [overlayOpacity, setOverlayOpacity] = useState(0.9);
   const [showColorbar, setShowColorbar] = useState(true);
   const [showFieldContours, setShowFieldContours] = useState(false);
+  const [showBathy, setShowBathy] = useState(true);
   const [showBathyContours, setShowBathyContours] = useState(false);
   const [depthRatio, setDepthRatio] = useState(0.35);
   const [depthWarpMode, setDepthWarpMode] = useState<"linear" | "upper">("upper");
   const [depthFocusM, setDepthFocusM] = useState(2500);
   const [deepRatio, setDeepRatio] = useState(0.25);
-  const [showBathyInTransect, setShowBathyInTransect] = useState(true);
   const [colorSettings, setColorSettings] = useState<Record<VarId, VarColorSettings>>(
     DEFAULT_COLOR_SETTINGS
   );
   const [showSeaIce, setShowSeaIce] = useState(true);
-  const [seaIceOpacity, setSeaIceOpacity] = useState(0.55);
-  const [showSeaIceColorbar, setShowSeaIceColorbar] = useState(true);
-  const [seaIceMin, setSeaIceMin] = useState(0.3);
-  const [seaIceHeightM, setSeaIceHeightM] = useState(5);
-  const [bathySource, setBathySource] = useState<"auto" | "bathy" | "rtopo_ds" | "rtopo">("bathy");
+  const [showWind, setShowWind] = useState(false);
 
   const [timeIdx, setTimeIdx] = useState(0);
   const [depthIdx, setDepthIdx] = useState(0);
@@ -170,11 +300,14 @@ export default function App() {
     "off"
   );
   const [seaIceError, setSeaIceError] = useState<string | null>(null);
+  const [windStatus, setWindStatus] = useState<"off" | "loading" | "ready" | "failed">("off");
+  const [windError, setWindError] = useState<string | null>(null);
 
   const [horizontalValues, setHorizontalValues] = useState<number[][] | null>(null);
   const [transectValues, setTransectValues] = useState<number[][] | null>(null);
   const [transectLatActual, setTransectLatActual] = useState<number | null>(null);
   const [seaIceValues, setSeaIceValues] = useState<number[][] | null>(null);
+  const [windStress, setWindStress] = useState<{ u: number[][]; v: number[][] } | null>(null);
 
   const [bathyInfo, setBathyInfo] = useState<{
     plotly: "loading" | "ready" | "failed";
@@ -196,20 +329,20 @@ export default function App() {
     () => (settings.tickCount > 0 ? makeTicks(settings.cmin, settings.cmax, settings.tickCount) : undefined),
     [settings.cmax, settings.cmin, settings.tickCount]
   );
-  const hasSeaIceColorbar = projectOn3d && showSeaIce && showSeaIceColorbar;
+  const hasSeaIceColorbar = projectOn3d && showSeaIce;
   const mainColorbarLayout = useMemo(
     () =>
-      hasSeaIceColorbar
-        ? { x: 1.03, y: 0.78, len: 0.42 }
-        : { x: 1.03, y: 0.52, len: 0.72 },
-    [hasSeaIceColorbar]
+      hasSeaIceColorbar && showColorbar
+        ? { x: 1.05, y: 0.70, len: 0.55 }
+        : { x: 1.05, y: 0.50, len: 0.78 },
+    [hasSeaIceColorbar, showColorbar]
   );
   const seaIceColorbarLayout = useMemo(
     () =>
-      hasSeaIceColorbar
-        ? { x: 1.03, y: 0.20, len: 0.26 }
-        : { x: 1.03, y: 0.52, len: 0.72 },
-    [hasSeaIceColorbar]
+      showColorbar
+        ? { x: 1.05, y: 0.20, len: 0.22 }
+        : { x: 1.05, y: 0.50, len: 0.78 },
+    [showColorbar]
   );
 
   const timeList = meta?.timeIso ?? [];
@@ -217,6 +350,16 @@ export default function App() {
   const latMin = meta?.lat?.length ? Math.min(...meta.lat) : 71;
   const latMax = meta?.lat?.length ? Math.max(...meta.lat) : 81.5;
   const safeTimeIdx = Math.max(0, Math.min(timeIdx, Math.max(0, timeList.length - 1)));
+  const seaIceFrameStride = playing ? 2 : 1;
+  const windFrameStride = playing ? 4 : 1;
+  const seaIceTimeIdx = useMemo(
+    () => Math.floor(safeTimeIdx / seaIceFrameStride) * seaIceFrameStride,
+    [safeTimeIdx, seaIceFrameStride]
+  );
+  const windTimeIdx = useMemo(
+    () => Math.floor(safeTimeIdx / windFrameStride) * windFrameStride,
+    [safeTimeIdx, windFrameStride]
+  );
   const safeDepthIdx = Math.max(0, Math.min(depthIdx, Math.max(0, zList.length - 1)));
   const activeTimeLabel = timeList[safeTimeIdx] ?? "n/a";
   const activeDepthLabel = zList.length ? `${Math.round(zList[safeDepthIdx])} m` : "n/a";
@@ -225,6 +368,55 @@ export default function App() {
     const vars = meta?.variables?.filter((v) => v.available).map((v) => v.id) ?? [];
     return vars.length ? (vars as VarId[]) : (["T"] as VarId[]);
   }, [meta]);
+
+  const horizontalRender = useMemo<HorizontalGrid | null>(() => {
+    if (!meta || !horizontalValues) return null;
+    if (!playing) return { values: horizontalValues, lon: meta.lon, lat: meta.lat };
+    return downsampleHorizontalGrid(
+      horizontalValues,
+      meta.lon,
+      meta.lat,
+      PLAYBACK_SURFACE_MAX,
+      PLAYBACK_SURFACE_MAX
+    );
+  }, [horizontalValues, meta, playing]);
+
+  const transectRender = useMemo<TransectGrid | null>(() => {
+    if (!meta || !transectValues) return null;
+    if (!playing) return { values: transectValues, lon: meta.lon, z: meta.z };
+    return downsampleTransectGrid(
+      transectValues,
+      meta.lon,
+      meta.z,
+      PLAYBACK_TRANSECT_LON_MAX,
+      PLAYBACK_TRANSECT_DEPTH_MAX
+    );
+  }, [meta, playing, transectValues]);
+
+  const seaIceRender = useMemo<HorizontalGrid | null>(() => {
+    if (!meta || !seaIceValues) return null;
+    if (!playing) return { values: seaIceValues, lon: meta.lon, lat: meta.lat };
+    return downsampleHorizontalGrid(
+      seaIceValues,
+      meta.lon,
+      meta.lat,
+      PLAYBACK_SEA_ICE_MAX,
+      PLAYBACK_SEA_ICE_MAX
+    );
+  }, [meta, playing, seaIceValues]);
+
+  const windRender = useMemo<VectorGrid | null>(() => {
+    if (!meta || !windStress) return null;
+    if (!playing) return { ...windStress, lon: meta.lon, lat: meta.lat };
+    return downsampleVectorGrid(
+      windStress.u,
+      windStress.v,
+      meta.lon,
+      meta.lat,
+      PLAYBACK_WIND_MAX,
+      PLAYBACK_WIND_MAX
+    );
+  }, [meta, playing, windStress]);
 
   useEffect(() => {
     let cancelled = false;
@@ -261,11 +453,10 @@ export default function App() {
     const t = window.setInterval(() => {
       // Avoid stepping time while the current frame is still loading.
       if (sliceStatus === "loading") return;
-      if (showSeaIce && seaIceStatus === "loading") return;
       setTimeIdx((i) => (i + 1) % timeList.length);
     }, intervalMs);
     return () => window.clearInterval(t);
-  }, [fps, metaStatus, playing, seaIceStatus, showSeaIce, sliceStatus, timeList.length]);
+  }, [fps, metaStatus, playing, sliceStatus, timeList.length]);
 
   useEffect(() => {
     if (!meta || metaStatus !== "ready") return;
@@ -348,7 +539,7 @@ export default function App() {
     let cancelled = false;
     setSeaIceStatus("loading");
     setSeaIceError(null);
-    loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex: safeTimeIdx })
+    loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex: seaIceTimeIdx })
       .then((values) => {
         if (cancelled) return;
         setSeaIceValues(values);
@@ -365,13 +556,45 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [meta, metaStatus, projectOn3d, safeTimeIdx, showSeaIce]);
+  }, [meta, metaStatus, projectOn3d, seaIceTimeIdx, showSeaIce]);
+
+  useEffect(() => {
+    if (!meta || metaStatus !== "ready" || !projectOn3d || !showWind) {
+      setWindStatus("off");
+      setWindError(null);
+      setWindStress(null);
+      return;
+    }
+
+    let cancelled = false;
+    setWindStatus("loading");
+    setWindError(null);
+    loadWindStress2D({ storeUrl: meta.storeUrl, tIndex: windTimeIdx })
+      .then((values) => {
+        if (cancelled) return;
+        setWindStress(values);
+        setWindStatus("ready");
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        console.error(e);
+        setWindStress(null);
+        setWindStatus("failed");
+        setWindError(e instanceof Error ? e.message : String(e));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [meta, metaStatus, projectOn3d, showWind, windTimeIdx]);
 
   useEffect(() => {
     if (!meta || metaStatus !== "ready" || !projectOn3d || !playing) return;
     if (!timeList.length) return;
-    const ahead = 3;
+    const ahead = 10;
     const yIndex = viewMode === "transect" ? nearestIndex(meta.lat, latTarget) : -1;
+    const seaIcePrefetch = new Set<number>();
+    const windPrefetch = new Set<number>();
     for (let step = 1; step <= ahead; step++) {
       const tIndex = (safeTimeIdx + step) % timeList.length;
       if (viewMode === "horizontal") {
@@ -392,9 +615,18 @@ export default function App() {
         }).catch(() => undefined);
       }
       if (showSeaIce) {
-        void loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex }).catch(() => undefined);
+        seaIcePrefetch.add(Math.floor(tIndex / seaIceFrameStride) * seaIceFrameStride);
+      }
+      if (showWind) {
+        windPrefetch.add(Math.floor(tIndex / windFrameStride) * windFrameStride);
       }
     }
+    seaIcePrefetch.forEach((tIndex) => {
+      void loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex }).catch(() => undefined);
+    });
+    windPrefetch.forEach((tIndex) => {
+      void loadWindStress2D({ storeUrl: meta.storeUrl, tIndex }).catch(() => undefined);
+    });
   }, [
     latTarget,
     meta,
@@ -403,19 +635,22 @@ export default function App() {
     projectOn3d,
     safeDepthIdx,
     safeTimeIdx,
+    seaIceFrameStride,
     showSeaIce,
+    showWind,
     timeList.length,
     varId,
     viewMode,
+    windFrameStride,
   ]);
 
   const horizontalField = useMemo(() => {
-    if (!meta || !projectOn3d || viewMode !== "horizontal" || !horizontalValues) return undefined;
+    if (!meta || !projectOn3d || viewMode !== "horizontal" || !horizontalRender) return undefined;
     return {
       enabled: true,
-      values: horizontalValues,
-      lon: meta.lon,
-      lat: meta.lat,
+      values: horizontalRender.values,
+      lon: horizontalRender.lon,
+      lat: horizontalRender.lat,
       cmin: settings.cmin,
       cmax: settings.cmax,
       colorscale,
@@ -433,7 +668,7 @@ export default function App() {
     };
   }, [
     colorscale,
-    horizontalValues,
+    horizontalRender,
     meta,
     overlayOpacity,
     projectOn3d,
@@ -451,13 +686,13 @@ export default function App() {
   ]);
 
   const transectField = useMemo(() => {
-    if (!meta || !projectOn3d || viewMode !== "transect" || !transectValues) return undefined;
+    if (!meta || !projectOn3d || viewMode !== "transect" || !transectRender) return undefined;
     return {
       enabled: true,
       lat: transectLatActual ?? latTarget,
-      lon: meta.lon,
-      z: meta.z,
-      values: transectValues,
+      lon: transectRender.lon,
+      z: transectRender.z,
+      values: transectRender.values,
       cmin: settings.cmin,
       cmax: settings.cmax,
       colorscale,
@@ -481,7 +716,7 @@ export default function App() {
     settings.cmax,
     settings.cmin,
     transectLatActual,
-    transectValues,
+    transectRender,
     viewMode,
     mainColorbarLayout.len,
     mainColorbarLayout.x,
@@ -489,28 +724,28 @@ export default function App() {
   ]);
 
   const seaIcePlane = useMemo(() => {
-    if (!meta || !projectOn3d || !showSeaIce || !seaIceValues) return null;
-    const masked = seaIceValues.map((row) =>
+    if (!meta || !projectOn3d || !showSeaIce || !seaIceRender) return null;
+    const masked = seaIceRender.values.map((row) =>
       row.map((v) => {
         const x = Number(v);
         if (!Number.isFinite(x)) return Number.NaN;
-        if (x <= seaIceMin) return Number.NaN;
+        if (x <= SEA_ICE_THRESHOLD) return Number.NaN;
         return Math.max(0, Math.min(1, x));
       })
     );
-    const cmin = Math.max(0, Math.min(0.99, seaIceMin));
+    const cmin = Math.max(0, Math.min(0.99, SEA_ICE_THRESHOLD));
     return {
       enabled: true,
       values: masked,
-      lon: meta.lon,
-      lat: meta.lat,
+      lon: seaIceRender.lon,
+      lat: seaIceRender.lat,
       cmin,
       cmax: 1,
       colorscale: paletteToColorscale(ice_256()),
-      opacity: seaIceOpacity,
+      opacity: SEA_ICE_OPACITY,
       mode: "surface" as const,
-      zPlane: seaIceHeightM,
-      showScale: showSeaIceColorbar,
+      zPlane: SEA_ICE_HEIGHT_M,
+      showScale: true,
       colorbarTitle: `Sea ice (${cmin.toFixed(2)}–1)`,
       colorbarTicks: [cmin, 0.5, 0.75, 1].filter((v, i, arr) => arr.indexOf(v) === i),
       colorbarLen: seaIceColorbarLayout.len,
@@ -520,15 +755,11 @@ export default function App() {
   }, [
     meta,
     projectOn3d,
-    seaIceHeightM,
-    seaIceMin,
-    seaIceOpacity,
-    seaIceValues,
+    seaIceRender,
     seaIceColorbarLayout.len,
     seaIceColorbarLayout.x,
     seaIceColorbarLayout.y,
     showSeaIce,
-    showSeaIceColorbar,
   ]);
 
   const horizontalPlanes = useMemo(() => {
@@ -539,6 +770,22 @@ export default function App() {
     projectOn3d,
     seaIcePlane,
   ]);
+
+  const windLayer = useMemo(() => {
+    if (!meta || !projectOn3d || !showWind || !windRender) return undefined;
+    return {
+      enabled: true,
+      lon: windRender.lon,
+      lat: windRender.lat,
+      u: windRender.u,
+      v: windRender.v,
+      zPlane: SEA_ICE_HEIGHT_M + 1,
+      particleCount: playing ? 280 : 520,
+      speed: 1,
+      color: "rgba(255,255,255,0.90)",
+      size: playing ? 1.1 : 1.35,
+    };
+  }, [meta, projectOn3d, showWind, windRender, playing]);
 
   const resetColorScale = useCallback(() => {
     setColorSettings((prev) => ({ ...prev, [varId]: DEFAULT_COLOR_SETTINGS[varId] }));
@@ -571,16 +818,17 @@ export default function App() {
   return (
     <div className="app">
       <Basemap3D
-        bathySource={bathySource}
+        bathySource="bathy"
         cameraResetNonce={cameraResetNonce}
         depthRatio={depthRatio}
         depthWarp={{ mode: depthWarpMode, focusDepthM: depthFocusM, deepRatio }}
-        showBathy={viewMode === "transect" ? showBathyInTransect : true}
+        showBathy={showBathy}
         onStatusChange={handleStatusChange}
         showBathyContours={showBathyContours}
         showFieldContours={showFieldContours}
         horizontalField={horizontalField}
         horizontalPlanes={horizontalPlanes}
+        windLayer={windLayer}
         transectField={transectField}
       />
 
@@ -649,6 +897,14 @@ export default function App() {
                   onClick={resetCamera}
                 >
                   ⟲
+                </button>
+                <button
+                  type="button"
+                  className="panelIconButton"
+                  title={themeMode === "night" ? "Switch to day mode" : "Switch to night mode"}
+                  onClick={() => setThemeMode((m) => (m === "night" ? "day" : "night"))}
+                >
+                  {themeMode === "night" ? "☀" : "☾"}
                 </button>
               </div>
               <div className="panelHeaderRight">
@@ -731,6 +987,67 @@ export default function App() {
                     <div>Field contours</div>
                     <ToggleSwitch checked={showFieldContours} onCheckedChange={setShowFieldContours} />
                   </div>
+                  <div className="toggleRow">
+                    <div>Bathy</div>
+                    <ToggleSwitch checked={showBathy} onCheckedChange={setShowBathy} />
+                  </div>
+                  <div className="toggleRow">
+                    <div>Bathy contours</div>
+                    <ToggleSwitch checked={showBathyContours} onCheckedChange={setShowBathyContours} />
+                  </div>
+                  <div className="toggleRow">
+                    <div>Sea ice</div>
+                    <ToggleSwitch checked={showSeaIce} onCheckedChange={setShowSeaIce} />
+                  </div>
+                  <div className="toggleRow">
+                    <div>Wind stress on ocean</div>
+                    <ToggleSwitch checked={showWind} onCheckedChange={setShowWind} />
+                  </div>
+                  <div className="toggleRow">
+                    <div>Movie</div>
+                    <ToggleSwitch
+                      checked={playing}
+                      onCheckedChange={setPlaying}
+                      disabled={metaStatus !== "ready" || !timeList.length}
+                    />
+                  </div>
+
+                  <label>
+                    Time ({activeTimeLabel})
+                    <input
+                      type="range"
+                      min={0}
+                      max={Math.max(0, timeList.length - 1)}
+                      value={safeTimeIdx}
+                      onChange={(e) => setTimeIdx(Number(e.target.value))}
+                      style={{ width: "100%" }}
+                      disabled={metaStatus !== "ready" || !timeList.length}
+                    />
+                    {timeList.length ? (
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          fontSize: 11,
+                          color: "rgba(255,255,255,0.62)",
+                          marginTop: 4,
+                        }}
+                      >
+                        <span>{timeList[0]}</span>
+                        <span>{timeList[timeList.length - 1]}</span>
+                      </div>
+                    ) : null}
+                  </label>
+
+                  <label>
+                    FPS
+                    <select value={String(fps)} onChange={(e) => setFps(Number(e.target.value))}>
+                      <option value="1">1</option>
+                      <option value="2">2</option>
+                      <option value="3">3</option>
+                      <option value="4">4</option>
+                    </select>
+                  </label>
                 </div>
               </details>
 
@@ -859,73 +1176,6 @@ export default function App() {
                     </>
                   ) : null}
 
-                  {viewMode === "transect" ? (
-                    <button
-                      type="button"
-                      className={`tab ${showBathyInTransect ? "tabActive" : ""}`}
-                      onClick={() => setShowBathyInTransect((v) => !v)}
-                      style={{ width: "100%" }}
-                    >
-                      Transect bathymetry {showBathyInTransect ? "On" : "Off"}
-                    </button>
-                  ) : null}
-                </div>
-              </details>
-
-              <details className="section" open>
-                <summary>Time</summary>
-                <div className="sectionBody">
-                  <label>
-                    Time ({activeTimeLabel})
-                    <input
-                      type="range"
-                      min={0}
-                      max={Math.max(0, timeList.length - 1)}
-                      value={safeTimeIdx}
-                      onChange={(e) => setTimeIdx(Number(e.target.value))}
-                      style={{ width: "100%" }}
-                      disabled={metaStatus !== "ready" || !timeList.length}
-                    />
-                    {timeList.length ? (
-                      <div
-                        style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          fontSize: 11,
-                          color: "rgba(255,255,255,0.62)",
-                          marginTop: 4,
-                        }}
-                      >
-                        <span>{timeList[0]}</span>
-                        <span>{timeList[timeList.length - 1]}</span>
-                      </div>
-                    ) : null}
-                  </label>
-
-                  <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
-                    <label style={{ flex: 1 }}>
-                      Animation
-                      <button
-                        type="button"
-                        className="tab tabActive"
-                        onClick={() => setPlaying((p) => !p)}
-                        style={{ width: "100%" }}
-                        disabled={metaStatus !== "ready" || !timeList.length}
-                      >
-                        {playing ? "Pause" : "Play"}
-                      </button>
-                    </label>
-
-                    <label style={{ width: 120 }}>
-                      FPS
-                      <select value={String(fps)} onChange={(e) => setFps(Number(e.target.value))}>
-                        <option value="1">1</option>
-                        <option value="2">2</option>
-                        <option value="3">3</option>
-                        <option value="4">4</option>
-                      </select>
-                    </label>
-                  </div>
                 </div>
               </details>
 
@@ -1050,100 +1300,6 @@ export default function App() {
               </details>
 
               <details className="section">
-                <summary>Overlays</summary>
-                <div className="sectionBody">
-                  <button
-                    type="button"
-                    className={`tab ${showSeaIce ? "tabActive" : ""}`}
-                    onClick={() => setShowSeaIce((v) => !v)}
-                    title="Sea ice concentration (SIarea)"
-                    style={{ width: "100%" }}
-                  >
-                    Sea ice {showSeaIce ? "On" : "Off"}
-                  </button>
-
-                  {showSeaIce ? (
-                    <label>
-                      Sea ice opacity
-                      <select
-                        value={String(seaIceOpacity)}
-                        onChange={(e) => setSeaIceOpacity(Number(e.target.value))}
-                        disabled={!projectOn3d}
-                      >
-                        <option value="0.25">0.25</option>
-                        <option value="0.35">0.35</option>
-                        <option value="0.45">0.45</option>
-                        <option value="0.55">0.55</option>
-                        <option value="0.65">0.65</option>
-                        <option value="0.75">0.75</option>
-                      </select>
-                      <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
-                        <label style={{ flex: 1 }}>
-                          Sea ice threshold
-                          <select value={String(seaIceMin)} onChange={(e) => setSeaIceMin(Number(e.target.value))}>
-                            <option value="0">0.00</option>
-                            <option value="0.02">0.02</option>
-                            <option value="0.05">0.05</option>
-                            <option value="0.1">0.10</option>
-                            <option value="0.15">0.15</option>
-                            <option value="0.2">0.20</option>
-                            <option value="0.25">0.25</option>
-                            <option value="0.3">0.30</option>
-                            <option value="0.35">0.35</option>
-                          </select>
-                          <div className="hint">Colorbar range matches threshold.</div>
-                        </label>
-                        <label style={{ flex: 1 }}>
-                          Height (m)
-                          <select value={String(seaIceHeightM)} onChange={(e) => setSeaIceHeightM(Number(e.target.value))}>
-                            <option value="0">0</option>
-                            <option value="1">1</option>
-                            <option value="2">2</option>
-                            <option value="5">5</option>
-                            <option value="10">10</option>
-                            <option value="20">20</option>
-                          </select>
-                        </label>
-                        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
-                          <div style={{ fontSize: 12, opacity: 0.75 }}>Colorbar</div>
-                          <button
-                            type="button"
-                            className={`tab ${showSeaIceColorbar ? "tabActive" : ""}`}
-                            onClick={() => setShowSeaIceColorbar((v) => !v)}
-                            disabled={!projectOn3d}
-                          >
-                            {showSeaIceColorbar ? "On" : "Off"}
-                          </button>
-                        </div>
-                      </div>
-                      <div className="hint">Status: {seaIceStatus}{seaIceError ? ` — ${seaIceError}` : ""}</div>
-                    </label>
-                  ) : (
-                    <div className="hint">Sea ice is a 2D overlay at z=0 (surface).</div>
-                  )}
-                </div>
-              </details>
-
-              <details className="section">
-                <summary>Bathymetry</summary>
-                <div className="sectionBody">
-                  <div className="toggleRow">
-                    <div>Bathy contours</div>
-                    <ToggleSwitch checked={showBathyContours} onCheckedChange={setShowBathyContours} />
-                  </div>
-                  <label>
-                    Bathymetry source
-                    <select value={bathySource} onChange={(e) => setBathySource(e.target.value as any)}>
-                      <option value="auto">Auto (prefer RTopo downsampled)</option>
-                      <option value="bathy">bathy.json</option>
-                      <option value="rtopo_ds">bathy_RTopo_ds.json</option>
-                      <option value="rtopo">bathy_RTopo.json (slow)</option>
-                    </select>
-                  </label>
-                </div>
-              </details>
-
-              <details className="section">
                 <summary>Status</summary>
                 <div className="sectionBody">
                   <div className="hint">
@@ -1155,6 +1311,16 @@ export default function App() {
                   <div className="hint">
                     Slice: <b>{sliceStatus}</b>
                     {sliceStatus === "failed" && sliceError ? <div style={{ marginTop: 6 }}>Error: {sliceError}</div> : null}
+                  </div>
+
+                  <div className="hint">
+                    Sea ice: <b>{showSeaIce ? seaIceStatus : "off"}</b>
+                    {seaIceStatus === "failed" && seaIceError ? <div style={{ marginTop: 6 }}>Error: {seaIceError}</div> : null}
+                  </div>
+
+                  <div className="hint">
+                    Wind stress on ocean: <b>{showWind ? windStatus : "off"}</b>
+                    {windStatus === "failed" && windError ? <div style={{ marginTop: 6 }}>Error: {windError}</div> : null}
                   </div>
 
                   <div className="hint">

@@ -138,6 +138,7 @@ const arrayPromiseCache = new Map<string, Promise<any>>();
 const horizontalSliceCache = new Map<string, Promise<number[][]>>();
 const transectSliceCache = new Map<string, Promise<{ values: number[][] }>>();
 const seaIceSliceCache = new Map<string, Promise<number[][]>>();
+const windSliceCache = new Map<string, Promise<{ u: number[][]; v: number[][] }>>();
 
 function cachePromise<T>(
   cache: Map<string, Promise<T>>,
@@ -409,5 +410,37 @@ export async function loadSeaIce2D(opts: {
       throw new Error(`Expected 2D SIarea, got shape [${shape.join(",")}]`);
     }
     return reshape2D(out.data as any, shape[0], shape[1]);
+  });
+}
+
+export async function loadWindStress2D(opts: {
+  storeUrl: string;
+  tIndex: number;
+  uVarId?: string;
+  vVarId?: string;
+}): Promise<{ u: number[][]; v: number[][] }> {
+  const uVar = opts.uVarId ?? "uwind_stress";
+  const vVar = opts.vVarId ?? "vwind_stress";
+  const key = `${opts.storeUrl}|${uVar}|${vVar}|${opts.tIndex}`;
+  return cachePromise(windSliceCache, key, 64, async () => {
+    const uArr = await openArray(opts.storeUrl, uVar);
+    const vArr = await openArray(opts.storeUrl, vVar);
+    const uOut = await zarr.get(uArr, [opts.tIndex, null, null] as any);
+    const vOut = await zarr.get(vArr, [opts.tIndex, null, null] as any);
+    if (uOut.shape.length !== 2) {
+      throw new Error(`Expected 2D ${uVar}, got shape [${uOut.shape.join(",")}]`);
+    }
+    if (vOut.shape.length !== 2) {
+      throw new Error(`Expected 2D ${vVar}, got shape [${vOut.shape.join(",")}]`);
+    }
+    if (uOut.shape[0] !== vOut.shape[0] || uOut.shape[1] !== vOut.shape[1]) {
+      throw new Error(
+        `Wind stress shape mismatch: ${uVar}[${uOut.shape.join(",")}] vs ${vVar}[${vOut.shape.join(",")}]`
+      );
+    }
+    return {
+      u: reshape2D(uOut.data as any, uOut.shape[0], uOut.shape[1]),
+      v: reshape2D(vOut.data as any, vOut.shape[0], vOut.shape[1]),
+    };
   });
 }
