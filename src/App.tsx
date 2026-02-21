@@ -1,8 +1,22 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Basemap3D from "./components/Basemap3D";
-import { ice_256, paletteToColorscale, rdylbu_r_256 } from "./lib/colormap";
+import {
+  balance_256,
+  blues_r_256,
+  deep_256,
+  haline_256,
+  ice_256,
+  paletteToColorscale,
+  plasma_256,
+  rdylbu_r_256,
+  thermal_256,
+  topo_256,
+  viridis_256,
+  type RGB,
+} from "./lib/colormap";
 import {
   loadGsZarrMeta,
+  load3DFieldAtTime,
   loadHorizontalSlice,
   loadSeaIce2D,
   loadWindStress2D,
@@ -11,9 +25,11 @@ import {
   type GsZarrMeta,
 } from "./lib/gsZarr";
 
-type ViewMode = "horizontal" | "transect";
+type ViewMode = "horizontal" | "transect" | "class";
 type VarId = "T" | "S";
 type ColorscaleMode = "continuous" | "discrete";
+type FieldColormapId = "thermal" | "haline" | "balance" | "rdylbu_r" | "viridis" | "plasma";
+type BathyColormapId = "deep" | "topo" | "blues_r" | "viridis" | "haline";
 
 type VarColorSettings = {
   cmin: number;
@@ -21,6 +37,18 @@ type VarColorSettings = {
   tickCount: number; // 0 => auto
   mode: ColorscaleMode;
   levels: number; // used when mode === "discrete"
+};
+
+type ClassSettings = {
+  min: number;
+  max: number;
+  interval: number;
+  halfWidth: number;
+};
+
+type ClassInputSettings = {
+  min: string;
+  max: string;
 };
 
 type HorizontalGrid = {
@@ -42,11 +70,25 @@ type VectorGrid = {
   lat: number[];
 };
 
+type ClassTrace = {
+  label: string;
+  value: number;
+  x: number[];
+  y: number[];
+  z: number[];
+};
+
 const PLAYBACK_SURFACE_MAX = 180;
 const PLAYBACK_TRANSECT_LON_MAX = 220;
 const PLAYBACK_TRANSECT_DEPTH_MAX = 110;
 const PLAYBACK_SEA_ICE_MAX = 150;
 const PLAYBACK_WIND_MAX = 110;
+const CLASS_MAX_XY_PLAYING = 70;
+const CLASS_MAX_XY_PAUSED = 110;
+const CLASS_MAX_Z_PLAYING = 24;
+const CLASS_MAX_Z_PAUSED = 36;
+const CLASS_POINTS_PER_CLASS_PLAYING = 700;
+const CLASS_POINTS_PER_CLASS_PAUSED = 1400;
 
 function clamp(n: number, min: number, max: number) {
   return Math.min(Math.max(n, min), max);
@@ -54,15 +96,89 @@ function clamp(n: number, min: number, max: number) {
 
 function defaultRange(varId: VarId) {
   if (varId === "T") return { min: -1, max: 8, ticks: [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8], title: "Temperature (°C)" };
-  return { min: 32, max: 36, ticks: [32, 33, 34, 35, 36], title: "Salinity (g/kg)" };
+  return {
+    min: 34,
+    max: 35.6,
+    ticks: [34, 34.1, 34.2, 34.3, 34.4, 34.5, 34.6, 34.7, 34.8, 34.9, 35, 35.1, 35.2, 35.3, 35.4, 35.5, 35.6],
+    title: "Salinity (g/kg)",
+  };
 }
 
-const RDYLBU_PALETTE = rdylbu_r_256();
-const RDYLBU_CONTINUOUS = paletteToColorscale(RDYLBU_PALETTE);
+const FIELD_COLORMAP_OPTIONS: Array<{ id: FieldColormapId; label: string }> = [
+  { id: "thermal", label: "cmocean thermal" },
+  { id: "haline", label: "cmocean haline" },
+  { id: "balance", label: "cmocean balance" },
+  { id: "rdylbu_r", label: "RdYlBu_r" },
+  { id: "viridis", label: "Viridis" },
+  { id: "plasma", label: "Plasma" },
+];
+
+const BATHY_COLORMAP_OPTIONS: Array<{ id: BathyColormapId; label: string }> = [
+  { id: "deep", label: "cmocean deep" },
+  { id: "topo", label: "cmocean topo" },
+  { id: "blues_r", label: "Blues_r" },
+  { id: "viridis", label: "Viridis" },
+  { id: "haline", label: "cmocean haline" },
+];
+
+const DEFAULT_FIELD_COLORMAP: Record<VarId, FieldColormapId> = {
+  T: "rdylbu_r",
+  S: "rdylbu_r",
+};
+
+const DEFAULT_BATHY_COLORMAP: BathyColormapId = "deep";
+
+function paletteForColormapId(id: FieldColormapId | BathyColormapId): RGB[] {
+  switch (id) {
+    case "thermal":
+      return thermal_256();
+    case "haline":
+      return haline_256();
+    case "balance":
+      return balance_256();
+    case "rdylbu_r":
+      return rdylbu_r_256();
+    case "viridis":
+      return viridis_256();
+    case "plasma":
+      return plasma_256();
+    case "deep":
+      return deep_256();
+    case "topo":
+      return topo_256();
+    case "blues_r":
+      return blues_r_256();
+    default:
+      return thermal_256();
+  }
+}
+
+const FALLBACK_FIELD_PALETTE = thermal_256();
+const FALLBACK_FIELD_CONTINUOUS = paletteToColorscale(FALLBACK_FIELD_PALETTE);
 
 const DEFAULT_COLOR_SETTINGS: Record<VarId, VarColorSettings> = {
   T: { cmin: -1, cmax: 8, tickCount: 10, mode: "continuous", levels: 12 },
-  S: { cmin: 32, cmax: 36, tickCount: 5, mode: "continuous", levels: 12 },
+  S: { cmin: 34, cmax: 35.6, tickCount: 17, mode: "continuous", levels: 12 },
+};
+
+const TICK_OPTIONS_BY_VAR: Record<VarId, number[]> = {
+  T: [5, 7, 9, 10, 11, 13],
+  S: [5, 7, 9, 11, 13, 15, 17, 21, 25],
+};
+
+const DEFAULT_CLASS_SETTINGS: Record<VarId, ClassSettings> = {
+  T: { min: -1, max: 8, interval: 1, halfWidth: 0.3 },
+  S: { min: 34, max: 35.6, interval: 0.2, halfWidth: 0.1 },
+};
+
+const CLASS_INTERVAL_OPTIONS: Record<VarId, number[]> = {
+  T: [0.5, 1, 2],
+  S: [0.1, 0.2, 0.5],
+};
+
+const CLASS_HALF_WIDTH_OPTIONS: Record<VarId, number[]> = {
+  T: [0.2, 0.3, 0.5],
+  S: [0.05, 0.1, 0.2],
 };
 
 const SEA_ICE_THRESHOLD = 0.3;
@@ -79,18 +195,27 @@ function makeTicks(min: number, max: number, tickCount: number) {
   return out;
 }
 
-function computeMinMax(values: number[][]) {
+function computeMinMax(values: number[][], opts?: { ignoreExactZero?: boolean }) {
+  const ignoreExactZero = Boolean(opts?.ignoreExactZero);
   let min = Infinity;
   let max = -Infinity;
   for (const row of values) {
     for (const v of row) {
       if (!Number.isFinite(v)) continue;
+      if (ignoreExactZero && v === 0) continue;
       min = Math.min(min, v);
       max = Math.max(max, v);
     }
   }
   if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
   return { min, max };
+}
+
+function parseFiniteNumberInput(raw: string): number | null {
+  const normalized = raw.trim().replace(",", ".");
+  if (!normalized) return null;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function sampleIndices(length: number, targetCount: number) {
@@ -187,13 +312,94 @@ function downsampleVectorGrid(
   };
 }
 
-function makeDiscreteColorscale(levels: number) {
-  const n = Math.max(2, Math.min(levels, RDYLBU_PALETTE.length));
+function classCenters(cmin: number, cmax: number, step: number) {
+  if (!Number.isFinite(cmin) || !Number.isFinite(cmax) || !Number.isFinite(step) || step <= 0) return [];
+  const min = Math.min(cmin, cmax);
+  const max = Math.max(cmin, cmax);
+  const out: number[] = [];
+  for (let value = min; value <= max + step * 1e-6; value += step) {
+    out.push(Number(value.toFixed(6)));
+    if (out.length >= 240) break;
+  }
+  if (out.length === 0) return [];
+  const last = out[out.length - 1];
+  if (last < max - step * 0.25 && out.length < 240) out.push(Number(max.toFixed(6)));
+  return out;
+}
+
+function formatClassLabel(varId: VarId, value: number, interval: number, withUnit = true) {
+  const digits = varId === "T" ? (interval >= 1 ? 0 : 1) : interval >= 0.2 ? 1 : 2;
+  const text = value.toFixed(digits);
+  if (!withUnit) return text;
+  return varId === "T" ? `${text}°C` : `${text} g/kg`;
+}
+
+function classColorAt(value: number, cmin: number, cmax: number, palette: RGB[]) {
+  if (!Number.isFinite(value) || !Number.isFinite(cmin) || !Number.isFinite(cmax) || cmax <= cmin) {
+    const safePalette = palette.length ? palette : FALLBACK_FIELD_PALETTE;
+    const mid = safePalette[Math.floor(safePalette.length / 2)];
+    return `rgb(${mid.r},${mid.g},${mid.b})`;
+  }
+  const safePalette = palette.length ? palette : FALLBACK_FIELD_PALETTE;
+  const t = clamp((value - cmin) / (cmax - cmin), 0, 1);
+  const idx = Math.max(0, Math.min(safePalette.length - 1, Math.round(t * (safePalette.length - 1))));
+  const c = safePalette[idx];
+  return `rgb(${c.r},${c.g},${c.b})`;
+}
+
+function makeClassDiscreteColorscale(
+  classValues: number[],
+  cmin: number,
+  cmax: number,
+  palette: RGB[]
+): Array<[number, string]> {
+  const safePalette = palette.length ? palette : FALLBACK_FIELD_PALETTE;
+  const fallbackScale = safePalette.length
+    ? paletteToColorscale(safePalette)
+    : FALLBACK_FIELD_CONTINUOUS;
+  if (!Number.isFinite(cmin) || !Number.isFinite(cmax) || cmax <= cmin) return fallbackScale;
+  const values = Array.from(
+    new Set(classValues.filter((v) => Number.isFinite(v)).map((v) => Number(v.toFixed(6))))
+  ).sort((a, b) => a - b);
+  if (!values.length) return fallbackScale;
+  if (values.length === 1) {
+    const color = classColorAt(values[0], cmin, cmax, safePalette);
+    return [
+      [0, color],
+      [1, color],
+    ];
+  }
+  const boundaries: number[] = [cmin];
+  for (let i = 0; i < values.length - 1; i++) {
+    boundaries.push((values[i] + values[i + 1]) / 2);
+  }
+  boundaries.push(cmax);
+  const out: Array<[number, string]> = [];
+  for (let i = 0; i < values.length; i++) {
+    const color = classColorAt(values[i], cmin, cmax, safePalette);
+    const t0 = clamp((boundaries[i] - cmin) / (cmax - cmin), 0, 1);
+    const t1 = clamp((boundaries[i + 1] - cmin) / (cmax - cmin), 0, 1);
+    out.push([t0, color], [t1, color]);
+  }
+  out[0][0] = 0;
+  out[out.length - 1][0] = 1;
+  return out;
+}
+
+function pickClassTicks(values: number[], maxTicks: number) {
+  if (values.length <= maxTicks) return values;
+  const idx = sampleIndices(values.length, maxTicks);
+  return idx.map((i) => values[i]);
+}
+
+function makeDiscreteColorscale(levels: number, palette: RGB[]) {
+  const safePalette = palette.length ? palette : FALLBACK_FIELD_PALETTE;
+  const n = Math.max(2, Math.min(levels, safePalette.length));
   const toCss = (c: { r: number; g: number; b: number }) => `rgb(${c.r},${c.g},${c.b})`;
   const sampled = Array.from({ length: n }, (_, i) => {
     const t = n === 1 ? 0 : i / (n - 1);
-    const idx = Math.round(t * (RDYLBU_PALETTE.length - 1));
-    return RDYLBU_PALETTE[idx];
+    const idx = Math.round(t * (safePalette.length - 1));
+    return safePalette[idx];
   });
   const out: Array<[number, string]> = [];
   for (let i = 0; i < n; i++) {
@@ -278,12 +484,40 @@ export default function App() {
   const [colorSettings, setColorSettings] = useState<Record<VarId, VarColorSettings>>(
     DEFAULT_COLOR_SETTINGS
   );
+  const [fieldColormapByVar, setFieldColormapByVar] = useState<Record<VarId, FieldColormapId>>(
+    DEFAULT_FIELD_COLORMAP
+  );
+  const [bathyColormap, setBathyColormap] = useState<BathyColormapId>(DEFAULT_BATHY_COLORMAP);
+  const [colorInputByVar, setColorInputByVar] = useState<Record<VarId, ClassInputSettings>>({
+    T: {
+      min: String(DEFAULT_COLOR_SETTINGS.T.cmin),
+      max: String(DEFAULT_COLOR_SETTINGS.T.cmax),
+    },
+    S: {
+      min: String(DEFAULT_COLOR_SETTINGS.S.cmin),
+      max: String(DEFAULT_COLOR_SETTINGS.S.cmax),
+    },
+  });
+  const [classSettingsByVar, setClassSettingsByVar] = useState<Record<VarId, ClassSettings>>(
+    DEFAULT_CLASS_SETTINGS
+  );
+  const [classInputByVar, setClassInputByVar] = useState<Record<VarId, ClassInputSettings>>({
+    T: {
+      min: String(DEFAULT_CLASS_SETTINGS.T.min),
+      max: String(DEFAULT_CLASS_SETTINGS.T.max),
+    },
+    S: {
+      min: String(DEFAULT_CLASS_SETTINGS.S.min),
+      max: String(DEFAULT_CLASS_SETTINGS.S.max),
+    },
+  });
   const [showSeaIce, setShowSeaIce] = useState(true);
   const [showWind, setShowWind] = useState(false);
 
   const [timeIdx, setTimeIdx] = useState(0);
   const [depthIdx, setDepthIdx] = useState(0);
   const [latTarget, setLatTarget] = useState(75);
+  const [latTargetInput, setLatTargetInput] = useState("75");
   const [playing, setPlaying] = useState(false);
   const [fps, setFps] = useState(1);
 
@@ -295,6 +529,8 @@ export default function App() {
     "off"
   );
   const [sliceError, setSliceError] = useState<string | null>(null);
+  const [classStatus, setClassStatus] = useState<"off" | "loading" | "ready" | "failed">("off");
+  const [classError, setClassError] = useState<string | null>(null);
 
   const [seaIceStatus, setSeaIceStatus] = useState<"off" | "loading" | "ready" | "failed">(
     "off"
@@ -306,6 +542,7 @@ export default function App() {
   const [horizontalValues, setHorizontalValues] = useState<number[][] | null>(null);
   const [transectValues, setTransectValues] = useState<number[][] | null>(null);
   const [transectLatActual, setTransectLatActual] = useState<number | null>(null);
+  const [classTraces, setClassTraces] = useState<ClassTrace[] | null>(null);
   const [seaIceValues, setSeaIceValues] = useState<number[][] | null>(null);
   const [windStress, setWindStress] = useState<{ u: number[][]; v: number[][] } | null>(null);
 
@@ -322,9 +559,21 @@ export default function App() {
 
   const range = useMemo(() => defaultRange(varId), [varId]);
   const settings = colorSettings[varId];
+  const classSettings = classSettingsByVar[varId];
+  const classInputs = classInputByVar[varId];
+  const colorInputs = colorInputByVar[varId];
+  const classMin = Math.min(classSettings.min, classSettings.max);
+  const classMax = Math.max(classSettings.min, classSettings.max);
+  const classInterval = classSettings.interval;
+  const classHalfWidth = classSettings.halfWidth;
+  const fieldPalette = useMemo(() => paletteForColormapId(fieldColormapByVar[varId]), [fieldColormapByVar, varId]);
+  const fieldContinuousColorscale = useMemo(() => paletteToColorscale(fieldPalette), [fieldPalette]);
+  const bathyPalette = useMemo(() => paletteForColormapId(bathyColormap), [bathyColormap]);
   const colorscale = useMemo(() => {
-    return settings.mode === "discrete" ? makeDiscreteColorscale(settings.levels) : RDYLBU_CONTINUOUS;
-  }, [settings.levels, settings.mode]);
+    return settings.mode === "discrete"
+      ? makeDiscreteColorscale(settings.levels, fieldPalette)
+      : fieldContinuousColorscale;
+  }, [fieldContinuousColorscale, fieldPalette, settings.levels, settings.mode]);
   const colorbarTicks = useMemo(
     () => (settings.tickCount > 0 ? makeTicks(settings.cmin, settings.cmax, settings.tickCount) : undefined),
     [settings.cmax, settings.cmin, settings.tickCount]
@@ -333,15 +582,15 @@ export default function App() {
   const mainColorbarLayout = useMemo(
     () =>
       hasSeaIceColorbar && showColorbar
-        ? { x: 1.05, y: 0.70, len: 0.55 }
-        : { x: 1.05, y: 0.50, len: 0.78 },
+        ? { x: 1.03, y: 0.69, len: 0.60 }
+        : { x: 1.03, y: 0.50, len: 0.84 },
     [hasSeaIceColorbar, showColorbar]
   );
   const seaIceColorbarLayout = useMemo(
     () =>
       showColorbar
-        ? { x: 1.05, y: 0.20, len: 0.22 }
-        : { x: 1.05, y: 0.50, len: 0.78 },
+        ? { x: 1.03, y: 0.17, len: 0.26 }
+        : { x: 1.03, y: 0.50, len: 0.84 },
     [showColorbar]
   );
 
@@ -350,16 +599,6 @@ export default function App() {
   const latMin = meta?.lat?.length ? Math.min(...meta.lat) : 71;
   const latMax = meta?.lat?.length ? Math.max(...meta.lat) : 81.5;
   const safeTimeIdx = Math.max(0, Math.min(timeIdx, Math.max(0, timeList.length - 1)));
-  const seaIceFrameStride = playing ? 2 : 1;
-  const windFrameStride = playing ? 4 : 1;
-  const seaIceTimeIdx = useMemo(
-    () => Math.floor(safeTimeIdx / seaIceFrameStride) * seaIceFrameStride,
-    [safeTimeIdx, seaIceFrameStride]
-  );
-  const windTimeIdx = useMemo(
-    () => Math.floor(safeTimeIdx / windFrameStride) * windFrameStride,
-    [safeTimeIdx, windFrameStride]
-  );
   const safeDepthIdx = Math.max(0, Math.min(depthIdx, Math.max(0, zList.length - 1)));
   const activeTimeLabel = timeList[safeTimeIdx] ?? "n/a";
   const activeDepthLabel = zList.length ? `${Math.round(zList[safeDepthIdx])} m` : "n/a";
@@ -368,6 +607,151 @@ export default function App() {
     const vars = meta?.variables?.filter((v) => v.available).map((v) => v.id) ?? [];
     return vars.length ? (vars as VarId[]) : (["T"] as VarId[]);
   }, [meta]);
+
+  useEffect(() => {
+    const nextMin = String(classSettings.min);
+    const nextMax = String(classSettings.max);
+    setClassInputByVar((prev) => {
+      const curr = prev[varId];
+      if (curr?.min === nextMin && curr?.max === nextMax) return prev;
+      return {
+        ...prev,
+        [varId]: { min: nextMin, max: nextMax },
+      };
+    });
+  }, [classSettings.max, classSettings.min, varId]);
+
+  useEffect(() => {
+    const nextMin = String(settings.cmin);
+    const nextMax = String(settings.cmax);
+    setColorInputByVar((prev) => {
+      const curr = prev[varId];
+      if (curr?.min === nextMin && curr?.max === nextMax) return prev;
+      return {
+        ...prev,
+        [varId]: { min: nextMin, max: nextMax },
+      };
+    });
+  }, [settings.cmax, settings.cmin, varId]);
+
+  useEffect(() => {
+    setLatTargetInput(String(Number(latTarget.toFixed(3))));
+  }, [latTarget]);
+
+  const commitClassInput = useCallback(
+    (bound: "min" | "max") => {
+      const raw = (classInputByVar[varId]?.[bound] ?? "").trim();
+      const parsed = parseFiniteNumberInput(raw);
+      const fallback = bound === "min" ? classSettings.min : classSettings.max;
+      if (parsed != null) {
+        setClassSettingsByVar((prev) => ({
+          ...prev,
+          [varId]: { ...prev[varId], [bound]: parsed },
+        }));
+        setClassInputByVar((prev) => ({
+          ...prev,
+          [varId]: {
+            ...(prev[varId] ?? { min: "", max: "" }),
+            [bound]: String(parsed),
+          },
+        }));
+      } else {
+        setClassInputByVar((prev) => ({
+          ...prev,
+          [varId]: {
+            ...(prev[varId] ?? { min: "", max: "" }),
+            [bound]: String(fallback),
+          },
+        }));
+      }
+    },
+    [classInputByVar, classSettings.max, classSettings.min, varId]
+  );
+
+  const updateClassInputLive = useCallback(
+    (bound: "min" | "max", rawValue: string) => {
+      setClassInputByVar((prev) => ({
+        ...prev,
+        [varId]: { ...(prev[varId] ?? { min: "", max: "" }), [bound]: rawValue },
+      }));
+      const parsed = parseFiniteNumberInput(rawValue);
+      if (parsed == null) return;
+      setClassSettingsByVar((prev) => ({
+        ...prev,
+        [varId]: {
+          ...prev[varId],
+          [bound]: parsed,
+        },
+      }));
+    },
+    [varId]
+  );
+
+  const commitColorInput = useCallback(
+    (bound: "min" | "max") => {
+      const raw = (colorInputByVar[varId]?.[bound] ?? "").trim();
+      const parsed = parseFiniteNumberInput(raw);
+      const fallback = bound === "min" ? settings.cmin : settings.cmax;
+      const colorKey = bound === "min" ? "cmin" : "cmax";
+      if (parsed != null) {
+        setColorSettings((prev) => ({
+          ...prev,
+          [varId]: {
+            ...prev[varId],
+            [colorKey]: parsed,
+          },
+        }));
+        setColorInputByVar((prev) => ({
+          ...prev,
+          [varId]: {
+            ...(prev[varId] ?? { min: "", max: "" }),
+            [bound]: String(parsed),
+          },
+        }));
+      } else {
+        setColorInputByVar((prev) => ({
+          ...prev,
+          [varId]: {
+            ...(prev[varId] ?? { min: "", max: "" }),
+            [bound]: String(fallback),
+          },
+        }));
+      }
+    },
+    [colorInputByVar, settings.cmax, settings.cmin, varId]
+  );
+
+  const updateColorInputLive = useCallback(
+    (bound: "min" | "max", rawValue: string) => {
+      setColorInputByVar((prev) => ({
+        ...prev,
+        [varId]: { ...(prev[varId] ?? { min: "", max: "" }), [bound]: rawValue },
+      }));
+      const parsed = parseFiniteNumberInput(rawValue);
+      if (parsed == null) return;
+      const colorKey = bound === "min" ? "cmin" : "cmax";
+      setColorSettings((prev) => ({
+        ...prev,
+        [varId]: {
+          ...prev[varId],
+          [colorKey]: parsed,
+        },
+      }));
+    },
+    [varId]
+  );
+
+  const commitLatTargetInput = useCallback(() => {
+    const raw = latTargetInput.trim();
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) {
+      const clamped = clamp(parsed, latMin, latMax);
+      setLatTarget(clamped);
+      setLatTargetInput(String(Number(clamped.toFixed(3))));
+    } else {
+      setLatTargetInput(String(Number(latTarget.toFixed(3))));
+    }
+  }, [latMax, latMin, latTarget, latTargetInput]);
 
   const horizontalRender = useMemo<HorizontalGrid | null>(() => {
     if (!meta || !horizontalValues) return null;
@@ -463,9 +847,12 @@ export default function App() {
     if (!projectOn3d) {
       setSliceStatus("off");
       setSliceError(null);
+      setClassStatus("off");
+      setClassError(null);
       setHorizontalValues(null);
       setTransectValues(null);
       setTransectLatActual(null);
+      setClassTraces(null);
       return;
     }
 
@@ -488,8 +875,11 @@ export default function App() {
           setHorizontalValues(values);
           setTransectValues(null);
           setTransectLatActual(null);
+          setClassTraces(null);
+          setClassStatus("off");
+          setClassError(null);
           setSliceStatus("ready");
-        } else {
+        } else if (viewMode === "transect") {
           const yIndex = nearestIndex(meta.lat, latTarget);
           const { values } = await loadTransectSlice({
             storeUrl: meta.storeUrl,
@@ -501,6 +891,116 @@ export default function App() {
           setTransectValues(values);
           setHorizontalValues(null);
           setTransectLatActual(meta.lat[yIndex] ?? latTarget);
+          setClassTraces(null);
+          setClassStatus("off");
+          setClassError(null);
+          setSliceStatus("ready");
+        } else {
+          setClassStatus("loading");
+          setClassError(null);
+
+          const full = await load3DFieldAtTime({
+            storeUrl: meta.storeUrl,
+            varId,
+            tIndex: safeTimeIdx,
+          });
+          if (cancelled) return;
+
+          const nxLimit = playing ? CLASS_MAX_XY_PLAYING : CLASS_MAX_XY_PAUSED;
+          const nyLimit = playing ? CLASS_MAX_XY_PLAYING : CLASS_MAX_XY_PAUSED;
+          const nzLimit = playing ? CLASS_MAX_Z_PLAYING : CLASS_MAX_Z_PAUSED;
+          const xIdx = sampleIndices(full.nx, nxLimit);
+          const yIdx = sampleIndices(full.ny, nyLimit);
+          const zIdx = sampleIndices(full.nz, nzLimit);
+
+          const centers = classCenters(classMin, classMax, classInterval);
+          const perClassCap = Math.max(
+            80,
+            playing ? CLASS_POINTS_PER_CLASS_PLAYING : CLASS_POINTS_PER_CLASS_PAUSED
+          );
+
+          if (!centers.length) {
+            setClassTraces([]);
+            setHorizontalValues(null);
+            setTransectValues(null);
+            setTransectLatActual(null);
+            setClassStatus("ready");
+            setSliceStatus("ready");
+            return;
+          }
+
+          const traces = centers.map((center, index) => ({
+            value: center,
+            label: formatClassLabel(varId, center, classInterval, true),
+            x: [] as number[],
+            y: [] as number[],
+            z: [] as number[],
+            seen: 0,
+            rand: ((safeTimeIdx + 1) * 2654435761 + (index + 1) * 2246822519) >>> 0,
+          }));
+
+          const step = classInterval;
+          const half = Math.max(0.05, classHalfWidth);
+          const minCenter = classMin;
+          const maxCenter = classMax;
+
+          for (let zk = 0; zk < zIdx.length; zk++) {
+            const zIndex = zIdx[zk];
+            const depth = Number(meta.z[zIndex]);
+            if (!Number.isFinite(depth)) continue;
+            for (let yk = 0; yk < yIdx.length; yk++) {
+              const yIndex = yIdx[yk];
+              const lat = Number(meta.lat[yIndex]);
+              if (!Number.isFinite(lat)) continue;
+              for (let xk = 0; xk < xIdx.length; xk++) {
+                const xIndex = xIdx[xk];
+                const lon = Number(meta.lon[xIndex]);
+                if (!Number.isFinite(lon)) continue;
+                const offset = zIndex * full.ny * full.nx + yIndex * full.nx + xIndex;
+                const value = Number(full.data[offset]);
+                if (!Number.isFinite(value)) continue;
+                if (value < minCenter - half || value > maxCenter + half) continue;
+
+                const bucket = Math.round((value - minCenter) / step);
+                if (bucket < 0 || bucket >= traces.length) continue;
+                const center = traces[bucket].value;
+                if (Math.abs(value - center) > half) continue;
+
+                const bucketTrace = traces[bucket];
+                bucketTrace.seen += 1;
+                if (bucketTrace.x.length < perClassCap) {
+                  bucketTrace.x.push(lon);
+                  bucketTrace.y.push(lat);
+                  bucketTrace.z.push(depth);
+                } else {
+                  bucketTrace.rand = (1664525 * bucketTrace.rand + 1013904223) >>> 0;
+                  const replace = bucketTrace.rand % bucketTrace.seen;
+                  if (replace < perClassCap) {
+                    bucketTrace.x[replace] = lon;
+                    bucketTrace.y[replace] = lat;
+                    bucketTrace.z[replace] = depth;
+                  }
+                }
+              }
+            }
+          }
+
+          const filtered: ClassTrace[] = traces
+            .filter((trace) => trace.x.length > 0)
+            .map((trace) => ({
+              label: trace.label,
+              value: trace.value,
+              x: trace.x,
+              y: trace.y,
+              z: trace.z,
+            }));
+
+          if (cancelled) return;
+          setClassTraces(filtered);
+          setHorizontalValues(null);
+          setTransectValues(null);
+          setTransectLatActual(null);
+          setClassStatus("ready");
           setSliceStatus("ready");
         }
       } catch (e) {
@@ -508,9 +1008,17 @@ export default function App() {
         console.error(e);
         setSliceStatus("failed");
         setSliceError(e instanceof Error ? e.message : String(e));
+        if (viewMode === "class") {
+          setClassStatus("failed");
+          setClassError(e instanceof Error ? e.message : String(e));
+        } else {
+          setClassStatus("off");
+          setClassError(null);
+        }
         setHorizontalValues(null);
         setTransectValues(null);
         setTransectLatActual(null);
+        setClassTraces(null);
       }
     })();
 
@@ -524,8 +1032,13 @@ export default function App() {
     projectOn3d,
     safeDepthIdx,
     safeTimeIdx,
+    classMax,
+    classMin,
+    classHalfWidth,
+    classInterval,
     varId,
     viewMode,
+    playing,
   ]);
 
   useEffect(() => {
@@ -539,7 +1052,7 @@ export default function App() {
     let cancelled = false;
     setSeaIceStatus("loading");
     setSeaIceError(null);
-    loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex: seaIceTimeIdx })
+    loadSeaIce2D({ storeUrl: meta.storeUrl, tIndex: safeTimeIdx })
       .then((values) => {
         if (cancelled) return;
         setSeaIceValues(values);
@@ -556,7 +1069,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [meta, metaStatus, projectOn3d, seaIceTimeIdx, showSeaIce]);
+  }, [meta, metaStatus, projectOn3d, safeTimeIdx, showSeaIce]);
 
   useEffect(() => {
     if (!meta || metaStatus !== "ready" || !projectOn3d || !showWind) {
@@ -569,7 +1082,7 @@ export default function App() {
     let cancelled = false;
     setWindStatus("loading");
     setWindError(null);
-    loadWindStress2D({ storeUrl: meta.storeUrl, tIndex: windTimeIdx })
+    loadWindStress2D({ storeUrl: meta.storeUrl, tIndex: safeTimeIdx })
       .then((values) => {
         if (cancelled) return;
         setWindStress(values);
@@ -586,7 +1099,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [meta, metaStatus, projectOn3d, showWind, windTimeIdx]);
+  }, [meta, metaStatus, projectOn3d, safeTimeIdx, showWind]);
 
   useEffect(() => {
     if (!meta || metaStatus !== "ready" || !projectOn3d || !playing) return;
@@ -606,19 +1119,27 @@ export default function App() {
           nLat: meta.lat.length,
           nLon: meta.lon.length,
         }).catch(() => undefined);
-      } else {
+      } else if (viewMode === "transect") {
         void loadTransectSlice({
           storeUrl: meta.storeUrl,
           varId,
           tIndex,
           yIndex,
         }).catch(() => undefined);
+      } else {
+        if (step <= 3) {
+          void load3DFieldAtTime({
+            storeUrl: meta.storeUrl,
+            varId,
+            tIndex,
+          }).catch(() => undefined);
+        }
       }
       if (showSeaIce) {
-        seaIcePrefetch.add(Math.floor(tIndex / seaIceFrameStride) * seaIceFrameStride);
+        seaIcePrefetch.add(tIndex);
       }
       if (showWind) {
-        windPrefetch.add(Math.floor(tIndex / windFrameStride) * windFrameStride);
+        windPrefetch.add(tIndex);
       }
     }
     seaIcePrefetch.forEach((tIndex) => {
@@ -635,13 +1156,11 @@ export default function App() {
     projectOn3d,
     safeDepthIdx,
     safeTimeIdx,
-    seaIceFrameStride,
     showSeaIce,
     showWind,
     timeList.length,
     varId,
     viewMode,
-    windFrameStride,
   ]);
 
   const horizontalField = useMemo(() => {
@@ -787,8 +1306,50 @@ export default function App() {
     };
   }, [meta, projectOn3d, showWind, windRender, playing]);
 
+  const classLayer = useMemo(() => {
+    if (!meta || !projectOn3d || viewMode !== "class" || !classTraces?.length) return undefined;
+    const classValues = classTraces.map((t) => t.value).sort((a, b) => a - b);
+    const ticks = pickClassTicks(classValues, 12);
+    const tickText = ticks.map((v) => formatClassLabel(varId, v, classInterval, false));
+    return {
+      enabled: true,
+      varLabel: range.title,
+      points: classTraces,
+      markerSize: playing ? 2.2 : 2.8,
+      opacity: 0.7,
+      showLegend: true,
+      cmin: classMin,
+      cmax: classMax,
+      colorscale: makeClassDiscreteColorscale(classValues, classMin, classMax, fieldPalette),
+      showScale: showColorbar,
+      colorbarTitle: `${range.title} class`,
+      colorbarTicks: ticks,
+      colorbarTickText: tickText,
+      colorbarLen: mainColorbarLayout.len,
+      colorbarX: mainColorbarLayout.x,
+      colorbarY: mainColorbarLayout.y,
+    };
+  }, [
+    classInterval,
+    classMax,
+    classMin,
+    classTraces,
+    fieldPalette,
+    mainColorbarLayout.len,
+    mainColorbarLayout.x,
+    mainColorbarLayout.y,
+    meta,
+    playing,
+    projectOn3d,
+    range.title,
+    showColorbar,
+    varId,
+    viewMode,
+  ]);
+
   const resetColorScale = useCallback(() => {
     setColorSettings((prev) => ({ ...prev, [varId]: DEFAULT_COLOR_SETTINGS[varId] }));
+    setFieldColormapByVar((prev) => ({ ...prev, [varId]: DEFAULT_FIELD_COLORMAP[varId] }));
   }, [varId]);
 
   const resetCamera = useCallback(() => {
@@ -803,7 +1364,7 @@ export default function App() {
   const autoColorScaleFromFrame = useCallback(() => {
     const values = viewMode === "horizontal" ? horizontalValues : transectValues;
     if (!values) return;
-    const mm = computeMinMax(values);
+    const mm = computeMinMax(values, { ignoreExactZero: varId === "S" });
     if (!mm) return;
     setColorSettings((prev) => ({
       ...prev,
@@ -819,6 +1380,7 @@ export default function App() {
     <div className="app">
       <Basemap3D
         bathySource="bathy"
+        bathyPalette={bathyPalette}
         cameraResetNonce={cameraResetNonce}
         depthRatio={depthRatio}
         depthWarp={{ mode: depthWarpMode, focusDepthM: depthFocusM, deepRatio }}
@@ -829,6 +1391,7 @@ export default function App() {
         horizontalField={horizontalField}
         horizontalPlanes={horizontalPlanes}
         windLayer={windLayer}
+        classLayer={classLayer}
         transectField={transectField}
       />
 
@@ -923,7 +1486,7 @@ export default function App() {
             <div className="title" style={{ marginBottom: 0 }}>
               <div>
                 <h1>Greenland Sea</h1>
-                <div className="sub">T/S + sea ice over 3D bathymetry</div>
+                {/* <div className="sub">T/S + sea ice over 3D bathymetry</div> */}
               </div>
             </div>
 
@@ -943,6 +1506,12 @@ export default function App() {
                       onClick={() => setViewMode("transect")}
                     >
                       Transect
+                    </button>
+                    <button
+                      className={`tab ${viewMode === "class" ? "tabActive" : ""}`}
+                      onClick={() => setViewMode("class")}
+                    >
+                      Class
                     </button>
                   </div>
 
@@ -1081,7 +1650,7 @@ export default function App() {
                         </div>
                       ) : null}
                     </label>
-                  ) : (
+                  ) : viewMode === "transect" ? (
                     <label>
                       Latitude target (°N) ({latTarget.toFixed(2)}°N)
                       <input
@@ -1109,11 +1678,15 @@ export default function App() {
                       <div style={{ marginTop: 8 }}>
                         <input
                           type="number"
-                          value={latTarget}
+                          value={latTargetInput}
                           min={latMin}
                           max={latMax}
                           step={0.05}
-                          onChange={(e) => setLatTarget(Number(e.target.value))}
+                          onChange={(e) => setLatTargetInput(e.target.value)}
+                          onBlur={commitLatTargetInput}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") commitLatTargetInput();
+                          }}
                           disabled={metaStatus !== "ready"}
                         />
                       </div>
@@ -1121,6 +1694,93 @@ export default function App() {
                         <div className="hint">Nearest model latitude: {transectLatActual.toFixed(3)}°N</div>
                       ) : null}
                     </label>
+                  ) : (
+                    <>
+                      <label>
+                        Class min
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={classInputs?.min ?? String(classSettings.min)}
+                          onInput={(e) => updateClassInputLive("min", (e.target as HTMLInputElement).value)}
+                          onBlur={() => commitClassInput("min")}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") commitClassInput("min");
+                          }}
+                        />
+                      </label>
+                      <label>
+                        Class max
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={classInputs?.max ?? String(classSettings.max)}
+                          onInput={(e) => updateClassInputLive("max", (e.target as HTMLInputElement).value)}
+                          onBlur={() => commitClassInput("max")}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") commitClassInput("max");
+                          }}
+                        />
+                      </label>
+                      <label>
+                        Class interval
+                        <select
+                          value={String(classInterval)}
+                          onChange={(e) =>
+                            setClassSettingsByVar((prev) => ({
+                              ...prev,
+                              [varId]: { ...prev[varId], interval: Number(e.target.value) },
+                            }))
+                          }
+                        >
+                          {CLASS_INTERVAL_OPTIONS[varId].map((opt) => (
+                            <option key={opt} value={String(opt)}>
+                              {opt}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        Class half-width
+                        <select
+                          value={String(classHalfWidth)}
+                          onChange={(e) =>
+                            setClassSettingsByVar((prev) => ({
+                              ...prev,
+                              [varId]: { ...prev[varId], halfWidth: Number(e.target.value) },
+                            }))
+                          }
+                        >
+                          {CLASS_HALF_WIDTH_OPTIONS[varId].map((opt) => (
+                            <option key={opt} value={String(opt)}>
+                              {opt}
+                            </option>
+                          ))}
+                        </select>
+                        <div className="hint">
+                          Showing {range.title} classes in [{classMin}, {classMax}].
+                        </div>
+                      </label>
+                      <button
+                        type="button"
+                        className="tab"
+                        onClick={() => {
+                          setClassSettingsByVar((prev) => ({
+                            ...prev,
+                            [varId]: DEFAULT_CLASS_SETTINGS[varId],
+                          }));
+                          setClassInputByVar((prev) => ({
+                            ...prev,
+                            [varId]: {
+                              min: String(DEFAULT_CLASS_SETTINGS[varId].min),
+                              max: String(DEFAULT_CLASS_SETTINGS[varId].max),
+                            },
+                          }));
+                        }}
+                      >
+                        Reset class defaults
+                      </button>
+                    </>
                   )}
 
                   <label>
@@ -1182,39 +1842,64 @@ export default function App() {
               <details className="section">
                 <summary>Color scale</summary>
                 <div className="sectionBody">
+                  <label>
+                    {varId === "T" ? "Temperature colormap" : "Salinity colormap"}
+                    <select
+                      value={fieldColormapByVar[varId]}
+                      onChange={(e) =>
+                        setFieldColormapByVar((prev) => ({
+                          ...prev,
+                          [varId]: e.target.value as FieldColormapId,
+                        }))
+                      }
+                    >
+                      {FIELD_COLORMAP_OPTIONS.map((opt) => (
+                        <option key={opt.id} value={opt.id}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label>
+                    Bathymetry colormap
+                    <select
+                      value={bathyColormap}
+                      onChange={(e) => setBathyColormap(e.target.value as BathyColormapId)}
+                    >
+                      {BATHY_COLORMAP_OPTIONS.map((opt) => (
+                        <option key={opt.id} value={opt.id}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
                   <div style={{ display: "flex", gap: 10 }}>
                     <label style={{ flex: 1 }}>
                       Min
                       <input
-                        type="number"
-                        value={settings.cmin}
-                        step={0.1}
-                        onChange={(e) =>
-                          setColorSettings((prev) => ({
-                            ...prev,
-                            [varId]: {
-                              ...prev[varId],
-                              cmin: e.target.value === "" ? prev[varId].cmin : Number(e.target.value),
-                            },
-                          }))
-                        }
+                        type="text"
+                        inputMode="decimal"
+                        value={colorInputs?.min ?? String(settings.cmin)}
+                        onInput={(e) => updateColorInputLive("min", (e.target as HTMLInputElement).value)}
+                        onBlur={() => commitColorInput("min")}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") commitColorInput("min");
+                        }}
                       />
                     </label>
                     <label style={{ flex: 1 }}>
                       Max
                       <input
-                        type="number"
-                        value={settings.cmax}
-                        step={0.1}
-                        onChange={(e) =>
-                          setColorSettings((prev) => ({
-                            ...prev,
-                            [varId]: {
-                              ...prev[varId],
-                              cmax: e.target.value === "" ? prev[varId].cmax : Number(e.target.value),
-                            },
-                          }))
-                        }
+                        type="text"
+                        inputMode="decimal"
+                        value={colorInputs?.max ?? String(settings.cmax)}
+                        onInput={(e) => updateColorInputLive("max", (e.target as HTMLInputElement).value)}
+                        onBlur={() => commitColorInput("max")}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") commitColorInput("max");
+                        }}
                       />
                     </label>
                   </div>
@@ -1248,10 +1933,11 @@ export default function App() {
                         }
                       >
                         <option value="0">Auto</option>
-                        <option value="5">5</option>
-                        <option value="7">7</option>
-                        <option value="9">9</option>
-                        <option value="11">11</option>
+                        {TICK_OPTIONS_BY_VAR[varId].map((count) => (
+                          <option key={count} value={String(count)}>
+                            {count}
+                          </option>
+                        ))}
                       </select>
                     </label>
 
@@ -1311,6 +1997,10 @@ export default function App() {
                   <div className="hint">
                     Slice: <b>{sliceStatus}</b>
                     {sliceStatus === "failed" && sliceError ? <div style={{ marginTop: 6 }}>Error: {sliceError}</div> : null}
+                  </div>
+                  <div className="hint">
+                    Class: <b>{viewMode === "class" ? classStatus : "off"}</b>
+                    {classStatus === "failed" && classError ? <div style={{ marginTop: 6 }}>Error: {classError}</div> : null}
                   </div>
 
                   <div className="hint">

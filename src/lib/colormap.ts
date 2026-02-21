@@ -69,6 +69,105 @@ export function blues_r_256(): RGB[] {
   return makeLinearPalette(stops, 256);
 }
 
+export function viridis_256(): RGB[] {
+  // Approximation of matplotlib viridis.
+  const stops = [
+    "#440154",
+    "#482878",
+    "#3e4989",
+    "#31688e",
+    "#26828e",
+    "#1f9e89",
+    "#35b779",
+    "#6ece58",
+    "#b5de2b",
+    "#fde725",
+  ];
+  return makeLinearPalette(stops, 256);
+}
+
+export function plasma_256(): RGB[] {
+  // Approximation of matplotlib plasma.
+  const stops = [
+    "#0d0887",
+    "#46039f",
+    "#7201a8",
+    "#9c179e",
+    "#bd3786",
+    "#d8576b",
+    "#ed7953",
+    "#fb9f3a",
+    "#fdca26",
+    "#f0f921",
+  ];
+  return makeLinearPalette(stops, 256);
+}
+
+export function thermal_256(): RGB[] {
+  // Approximation of cmocean.cm.thermal.
+  const stops = [
+    "#042333",
+    "#184a84",
+    "#2f74b6",
+    "#55a7c7",
+    "#8fd0c6",
+    "#cfe8b8",
+    "#f6e08b",
+    "#f6b65a",
+    "#e46f37",
+    "#b3162e",
+  ];
+  return makeLinearPalette(stops, 256);
+}
+
+export function haline_256(): RGB[] {
+  // Approximation of cmocean.cm.haline.
+  const stops = [
+    "#2a186c",
+    "#14439a",
+    "#1d6fb5",
+    "#2a95bf",
+    "#4fbac5",
+    "#88d7c3",
+    "#c5e8ba",
+    "#f1efb3",
+    "#fbe28b",
+  ];
+  return makeLinearPalette(stops, 256);
+}
+
+export function balance_256(): RGB[] {
+  // Approximation of cmocean.cm.balance.
+  const stops = [
+    "#1f3b87",
+    "#3f68b8",
+    "#77a9d4",
+    "#c7ddeb",
+    "#f7f7f7",
+    "#f3d2c1",
+    "#e28d6d",
+    "#c44a4e",
+    "#8a1f46",
+  ];
+  return makeLinearPalette(stops, 256);
+}
+
+export function deep_256(): RGB[] {
+  // Approximation of cmocean.cm.deep (dark deep-ocean blue -> lighter shallow blue/teal).
+  const stops = [
+    "#0a1026",
+    "#102451",
+    "#173c74",
+    "#225892",
+    "#2f76aa",
+    "#4b97bc",
+    "#6eb6c8",
+    "#97d2cf",
+    "#c4ece1",
+  ];
+  return makeLinearPalette(stops, 256);
+}
+
 export function topo_256(): RGB[] {
   // Approximation of cmocean.topo: deep blue -> shallow -> greens -> browns -> white.
   const stops = [

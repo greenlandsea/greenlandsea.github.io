@@ -137,6 +137,10 @@ async function loadBathyLonLat(): Promise<BathyGrid> {
 const arrayPromiseCache = new Map<string, Promise<any>>();
 const horizontalSliceCache = new Map<string, Promise<number[][]>>();
 const transectSliceCache = new Map<string, Promise<{ values: number[][] }>>();
+const field3DCache = new Map<
+  string,
+  Promise<{ data: Float32Array; nz: number; ny: number; nx: number }>
+>();
 const seaIceSliceCache = new Map<string, Promise<number[][]>>();
 const windSliceCache = new Map<string, Promise<{ u: number[][]; v: number[][] }>>();
 
@@ -368,14 +372,17 @@ export async function load3DFieldAtTime(opts: {
   varId: "T" | "S";
   tIndex: number;
 }): Promise<{ data: Float32Array; nz: number; ny: number; nx: number }> {
-  const arr = await openArray(opts.storeUrl, opts.varId);
-  const out = await zarr.get(arr, [opts.tIndex, null, null, null] as any);
-  const shape = out.shape;
-  if (shape.length !== 3) {
-    throw new Error(`Expected 3D field, got shape [${shape.join(",")}]`);
-  }
-  const data = ensureFloat32(out.data as any);
-  return { data, nz: shape[0], ny: shape[1], nx: shape[2] };
+  const key = `${opts.storeUrl}|${opts.varId}|3d|${opts.tIndex}`;
+  return cachePromise(field3DCache, key, 8, async () => {
+    const arr = await openArray(opts.storeUrl, opts.varId);
+    const out = await zarr.get(arr, [opts.tIndex, null, null, null] as any);
+    const shape = out.shape;
+    if (shape.length !== 3) {
+      throw new Error(`Expected 3D field, got shape [${shape.join(",")}]`);
+    }
+    const data = ensureFloat32(out.data as any);
+    return { data, nz: shape[0], ny: shape[1], nx: shape[2] };
+  });
 }
 
 export function slice3DTo2D(opts: {

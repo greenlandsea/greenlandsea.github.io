@@ -3,7 +3,7 @@ import type { Layout, PlotData } from "plotly.js";
 import { withBase } from "../lib/paths";
 import { makeSyntheticGreenlandSeaBathy } from "../lib/syntheticBathy";
 import {
-  blues_r_256,
+  deep_256,
   paletteToColorscale,
   rdylbu_r_256,
   rgbKey,
@@ -98,6 +98,33 @@ type WindLayer = {
   size?: number;
 };
 
+type ClassPointTrace = {
+  label: string;
+  value: number;
+  x: number[];
+  y: number[];
+  z: number[];
+};
+
+type ClassLayer = {
+  enabled: boolean;
+  varLabel?: string;
+  points: ClassPointTrace[];
+  markerSize?: number;
+  opacity?: number;
+  showLegend?: boolean;
+  cmin: number;
+  cmax: number;
+  colorscale: Array<[number, string]>;
+  showScale?: boolean;
+  colorbarTitle?: string;
+  colorbarTicks?: number[];
+  colorbarTickText?: string[];
+  colorbarLen?: number;
+  colorbarX?: number;
+  colorbarY?: number;
+};
+
 type WindParticle = {
   x: number;
   y: number;
@@ -106,6 +133,55 @@ type WindParticle = {
   trailX: number[];
   trailY: number[];
 };
+
+function makeColorbarConfig(opts: {
+  title: string;
+  len?: number;
+  x?: number;
+  y?: number;
+  tickvals?: number[];
+  ticktext?: string[];
+}) {
+  return {
+    title: {
+      text: opts.title,
+      side: "right",
+      font: { size: 14 },
+    },
+    ...(opts.tickvals ? { tickmode: "array", tickvals: opts.tickvals } : null),
+    ...(opts.ticktext?.length ? { ticktext: opts.ticktext } : null),
+    ticks: "outside",
+    tickfont: { size: 12 },
+    thickness: 20,
+    thicknessmode: "pixels",
+    outlinewidth: 1,
+    outlinecolor: "rgba(255,255,255,0.35)",
+    len: opts.len ?? 0.62,
+    ...(Number.isFinite(opts.x) ? { x: opts.x } : null),
+    ...(Number.isFinite(opts.y) ? { y: opts.y } : null),
+  } as any;
+}
+
+function colorFromColorscale(
+  value: number,
+  cmin: number,
+  cmax: number,
+  colorscale: Array<[number, string]>
+) {
+  if (!Number.isFinite(value) || !Number.isFinite(cmin) || !Number.isFinite(cmax) || cmax <= cmin) {
+    return "rgba(255,255,255,0.9)";
+  }
+  if (!Array.isArray(colorscale) || colorscale.length === 0) return "rgba(255,255,255,0.9)";
+  const t = Math.max(0, Math.min(1, (value - cmin) / (cmax - cmin)));
+  let picked = colorscale[0][1];
+  for (let i = 0; i < colorscale.length; i++) {
+    const stop = Number(colorscale[i][0]);
+    if (!Number.isFinite(stop)) continue;
+    if (t + 1e-9 >= stop) picked = colorscale[i][1];
+    else break;
+  }
+  return picked;
+}
 
 async function tryLoadBathyJson(
   bathySource?: "auto" | "bathy" | "rtopo_ds" | "rtopo"
@@ -280,6 +356,7 @@ function normalizeCamera(input: any): any | null {
 
 export default function Basemap3D(props: {
   bathySource?: "auto" | "bathy" | "rtopo_ds" | "rtopo";
+  bathyPalette?: RGB[];
   depthRatio?: number;
   depthWarp?: {
     mode: "linear" | "upper";
@@ -313,6 +390,7 @@ export default function Basemap3D(props: {
   };
   transectField?: TransectField;
   windLayer?: WindLayer;
+  classLayer?: ClassLayer;
   onStatusChange?: (status: {
     plotly: "loading" | "ready" | "failed";
     bathy: "loading" | "file" | "synthetic";
@@ -514,7 +592,11 @@ export default function Basemap3D(props: {
   const colorscale332 = useMemo(() => makeDiscreteColorscale332(), []);
   const rdylbuPalette = useMemo<RGB[]>(() => rdylbu_r_256(), []);
   const rdylbuColorscale = useMemo(() => paletteToColorscale(rdylbuPalette), [rdylbuPalette]);
-  const bluesPalette = useMemo<RGB[]>(() => blues_r_256(), []);
+  const defaultBathyPalette = useMemo<RGB[]>(() => deep_256(), []);
+  const activeBathyPalette = useMemo<RGB[]>(
+    () => (props.bathyPalette?.length ? props.bathyPalette : defaultBathyPalette),
+    [defaultBathyPalette, props.bathyPalette]
+  );
   const topoPalette = useMemo<RGB[]>(() => topo_256(), []);
   const topoColorscale = useMemo(() => paletteToColorscale(topoPalette), [topoPalette]);
 
@@ -1035,6 +1117,7 @@ export default function Basemap3D(props: {
         surfacecolor: overlaySurfacecolor as any,
         cmin: overlayCmin,
         cmax: overlayCmax,
+        cauto: false,
         colorscale: overlayColorscale as any,
         lighting: {
           ambient: 0.95,
@@ -1057,14 +1140,13 @@ export default function Basemap3D(props: {
         ...(showOverlayScale
           ? {
               colorbar: {
-                title: { text: overlayColorbarTitle },
-                ...(overlayColorbarTicks
-                  ? { tickmode: "array", tickvals: overlayColorbarTicks }
-                  : null),
-                ticks: "outside",
-                len: overlayColorbarLen ?? 0.55,
-                ...(Number.isFinite(overlayColorbarX) ? { x: overlayColorbarX } : null),
-                ...(Number.isFinite(overlayColorbarY) ? { y: overlayColorbarY } : null),
+                ...makeColorbarConfig({
+                  title: overlayColorbarTitle,
+                  tickvals: overlayColorbarTicks,
+                  len: overlayColorbarLen,
+                  x: overlayColorbarX,
+                  y: overlayColorbarY,
+                }),
               } as any,
             }
           : null),
@@ -1079,8 +1161,8 @@ export default function Basemap3D(props: {
         const denom = Math.max(1, nBins - 1);
         const sampled = Array.from({ length: nBins }, (_, i) => {
           const t = denom ? i / denom : 0;
-          const idx = Math.round(t * (bluesPalette.length - 1));
-          return bluesPalette[idx];
+          const idx = Math.round(t * (activeBathyPalette.length - 1));
+          return activeBathyPalette[idx];
         });
         const toCss = (c: RGB) => `rgb(${c.r},${c.g},${c.b})`;
         const oceanColorscale: Array<[number, string]> = [];
@@ -1148,6 +1230,7 @@ export default function Basemap3D(props: {
           surfacecolor: zOcean as any,
           cmin,
           cmax,
+          cauto: false,
           colorscale: oceanColorscale as any,
           showscale: false,
           lighting: { ambient: 0.85, diffuse: 0.35, specular: 0.05, roughness: 0.95 } as any,
@@ -1176,6 +1259,7 @@ export default function Basemap3D(props: {
             surfacecolor: cLand as any,
             cmin: 0,
             cmax: landMax,
+            cauto: false,
             colorscale: topoColorscale as any,
             showscale: false,
             lighting: { ambient: 0.95, diffuse: 0.2, specular: 0.0, roughness: 1.0 } as any,
@@ -1191,13 +1275,7 @@ export default function Basemap3D(props: {
           x: bathy.lon,
           y: bathy.lat,
           z: bathyZPlot,
-          colorscale: [
-            [0.0, "#06162a"],
-            [0.2, "#0b2b4a"],
-            [0.45, "#124f6a"],
-            [0.7, "#2f7e74"],
-            [1.0, "#a0c7a0"],
-          ],
+          colorscale: paletteToColorscale(activeBathyPalette) as any,
           lighting: {
             ambient: 0.8,
             diffuse: 0.35,
@@ -1390,19 +1468,19 @@ export default function Basemap3D(props: {
         hovertext: hoverText as any,
         cmin: overlayCmin,
         cmax: overlayCmax,
+        cauto: false,
         colorscale: overlayColorscale as any,
         showscale: showOverlayScale,
         ...(showOverlayScale
           ? {
               colorbar: {
-                title: { text: overlayColorbarTitle },
-                ...(overlayColorbarTicks
-                  ? { tickmode: "array", tickvals: overlayColorbarTicks }
-                  : null),
-                ticks: "outside",
-                len: overlayColorbarLen ?? 0.55,
-                ...(Number.isFinite(overlayColorbarX) ? { x: overlayColorbarX } : null),
-                ...(Number.isFinite(overlayColorbarY) ? { y: overlayColorbarY } : null),
+                ...makeColorbarConfig({
+                  title: overlayColorbarTitle,
+                  tickvals: overlayColorbarTicks,
+                  len: overlayColorbarLen,
+                  x: overlayColorbarX,
+                  y: overlayColorbarY,
+                }),
               } as any,
             }
           : null),
@@ -1466,17 +1544,19 @@ export default function Basemap3D(props: {
         hovertext: hoverText as any,
         cmin: p.cmin,
         cmax: p.cmax,
+        cauto: false,
         colorscale: p.colorscale as any,
         showscale: showScale,
         ...(showScale
           ? {
               colorbar: {
-                title: { text: p.colorbarTitle ?? "Value" },
-                ...(p.colorbarTicks ? { tickmode: "array", tickvals: p.colorbarTicks } : null),
-                ticks: "outside",
-                len: p.colorbarLen ?? 0.55,
-                ...(Number.isFinite(p.colorbarX) ? { x: p.colorbarX } : null),
-                ...(Number.isFinite(p.colorbarY) ? { y: p.colorbarY } : null),
+                ...makeColorbarConfig({
+                  title: p.colorbarTitle ?? "Value",
+                  tickvals: p.colorbarTicks,
+                  len: p.colorbarLen,
+                  x: p.colorbarX,
+                  y: p.colorbarY,
+                }),
               } as any,
             }
           : null),
@@ -1512,11 +1592,149 @@ export default function Basemap3D(props: {
       }
     }
 
+    if (props.classLayer?.enabled && Array.isArray(props.classLayer.points)) {
+      const markerSize = Math.max(1, Number(props.classLayer.markerSize ?? 2.4));
+      const opacity = Math.max(0.1, Math.min(1, Number(props.classLayer.opacity ?? 0.7)));
+      const showLegend = props.classLayer.showLegend !== false;
+      const legendMarkerSize = Math.max(7, markerSize + 3.5);
+      const showScale = props.classLayer.showScale !== false;
+      if (showScale && props.classLayer.points.length) {
+        const colorValues = props.classLayer.points
+          .map((p) => Number(p.value))
+          .filter((v) => Number.isFinite(v));
+        if (colorValues.length) {
+          traces.push({
+            type: "scatter3d",
+            mode: "markers",
+            name: "Class colorbar",
+            x: colorValues.map(() => Number.NaN) as any,
+            y: colorValues.map(() => Number.NaN) as any,
+            z: colorValues.map(() => Number.NaN) as any,
+            marker: {
+              size: 1,
+              color: colorValues as any,
+              cmin: props.classLayer.cmin,
+              cmax: props.classLayer.cmax,
+              cauto: false,
+              colorscale: props.classLayer.colorscale as any,
+              showscale: true,
+              colorbar: {
+                ...makeColorbarConfig({
+                  title: props.classLayer.colorbarTitle ?? props.classLayer.varLabel ?? "Class",
+                  tickvals: props.classLayer.colorbarTicks,
+                  ticktext: props.classLayer.colorbarTickText,
+                  len: props.classLayer.colorbarLen,
+                  x: props.classLayer.colorbarX,
+                  y: props.classLayer.colorbarY,
+                }),
+              } as any,
+              opacity: 0,
+            } as any,
+            showlegend: false,
+            hoverinfo: "skip",
+          });
+        }
+      }
+      for (let idx = 0; idx < props.classLayer.points.length; idx++) {
+        const cls = props.classLayer.points[idx];
+        if (!Array.isArray(cls.x) || !Array.isArray(cls.y) || !Array.isArray(cls.z)) continue;
+        if (!cls.x.length || cls.x.length !== cls.y.length || cls.x.length !== cls.z.length) continue;
+        const zPlot = cls.z.map((zv) => scaleZ(Number(zv)));
+        const customDepth = cls.z.map((zv) => Number(zv));
+        const classColor = colorFromColorscale(
+          Number(cls.value),
+          props.classLayer.cmin,
+          props.classLayer.cmax,
+          props.classLayer.colorscale
+        );
+        const classLabel = cls.label || `${cls.value}`;
+        if (showLegend) {
+          traces.push({
+            type: "scatter3d",
+            mode: "markers",
+            name: `${classLabel} class`,
+            x: [Number.NaN] as any,
+            y: [Number.NaN] as any,
+            z: [Number.NaN] as any,
+            marker: {
+              size: legendMarkerSize,
+              color: classColor,
+              opacity: 1,
+            } as any,
+            showlegend: true,
+            hoverinfo: "skip",
+          });
+        }
+        traces.push({
+          type: "scatter3d",
+          mode: "markers",
+          name: `${classLabel} class`,
+          x: cls.x as any,
+          y: cls.y as any,
+          z: zPlot as any,
+          customdata: customDepth as any,
+          marker: {
+            size: markerSize,
+            color: classColor,
+            opacity,
+          } as any,
+          showlegend: false,
+          hovertemplate:
+            `Class: ${classLabel}<br>` +
+            `Lon %{x:.2f}°<br>` +
+            `Lat %{y:.2f}°<br>` +
+            `Depth %{customdata:.0f} m<extra></extra>`,
+        });
+      }
+    }
+
     const numericT = props.transectField?.enabled ? props.transectField : null;
     if (numericT) {
       const zScaled = numericT.z.map((zv) => scaleZ(zv));
-      const zCurtain = zScaled.map((zv) => numericT.lon.map(() => zv));
-      const transectHoverText = numericT.values.map((row, j) =>
+      const latTarget = Number(numericT.lat);
+      let bathyLatIdx = 0;
+      if (bathy.lat.length > 1 && Number.isFinite(latTarget)) {
+        let best = 0;
+        let bestD = Math.abs(Number(bathy.lat[0]) - latTarget);
+        for (let j = 1; j < bathy.lat.length; j++) {
+          const d = Math.abs(Number(bathy.lat[j]) - latTarget);
+          if (d < bestD) {
+            best = j;
+            bestD = d;
+          }
+        }
+        bathyLatIdx = best;
+      }
+      const bathyLonIdx = numericT.lon.map((xv) => {
+        let best = 0;
+        let bestD = Math.abs(Number(bathy.lon[0]) - Number(xv));
+        for (let i = 1; i < bathy.lon.length; i++) {
+          const d = Math.abs(Number(bathy.lon[i]) - Number(xv));
+          if (d < bestD) {
+            best = i;
+            bestD = d;
+          }
+        }
+        return best;
+      });
+      const bottomByLon = bathyLonIdx.map((i) => Number(bathy.z[bathyLatIdx]?.[i]));
+      const valuesMasked = numericT.values.map((row, j) => {
+        const depth = Number(numericT.z[j]);
+        return row.map((val, i) => {
+          const n = Number(val);
+          if (!Number.isFinite(n)) return Number.NaN;
+          const bottom = Number(bottomByLon[i]);
+          if (Number.isFinite(bottom)) {
+            if (bottom >= -1e-6) return Number.NaN;
+            if (Number.isFinite(depth) && depth < bottom - 1e-6) return Number.NaN;
+          }
+          return n;
+        });
+      });
+      const zCurtain = zScaled.map((zv, j) =>
+        numericT.lon.map((_, i) => (Number.isFinite(valuesMasked[j]?.[i]) ? zv : Number.NaN))
+      );
+      const transectHoverText = valuesMasked.map((row, j) =>
         row.map((val, i) => {
           const n = Number(val);
           const vText = Number.isFinite(n) ? n.toFixed(3) : "n/a";
@@ -1534,23 +1752,23 @@ export default function Basemap3D(props: {
         x: numericT.lon,
         y: numericT.z.map(() => numericT.lat),
         z: zCurtain as any,
-        surfacecolor: numericT.values as any,
+        surfacecolor: valuesMasked as any,
         hovertext: transectHoverText as any,
         cmin: numericT.cmin,
         cmax: numericT.cmax,
+        cauto: false,
         colorscale: numericT.colorscale as any,
         showscale: Boolean(numericT.showScale),
         ...(numericT.showScale
           ? {
               colorbar: {
-                title: { text: numericT.colorbarTitle ?? "Value" },
-                ...(numericT.colorbarTicks
-                  ? { tickmode: "array", tickvals: numericT.colorbarTicks }
-                  : null),
-                ticks: "outside",
-                len: numericT.colorbarLen ?? 0.55,
-                ...(Number.isFinite(numericT.colorbarX) ? { x: numericT.colorbarX } : null),
-                ...(Number.isFinite(numericT.colorbarY) ? { y: numericT.colorbarY } : null),
+                ...makeColorbarConfig({
+                  title: numericT.colorbarTitle ?? "Value",
+                  tickvals: numericT.colorbarTicks,
+                  len: numericT.colorbarLen,
+                  x: numericT.colorbarX,
+                  y: numericT.colorbarY,
+                }),
               } as any,
             }
           : null),
@@ -1568,6 +1786,7 @@ export default function Basemap3D(props: {
         surfacecolor: transectCurtain.surfacecolor as any,
         cmin: 0,
         cmax: 255,
+        cauto: false,
         colorscale: colorscale332 as any,
         showscale: false,
         opacity,
@@ -1591,6 +1810,8 @@ export default function Basemap3D(props: {
     props.transectOverlay?.enabled,
     props.transectOverlay?.opacity,
     props.windLayer,
+    props.classLayer,
+    activeBathyPalette,
     props.showBathyContours,
     props.showFieldContours,
     scaleZ,
@@ -1640,6 +1861,17 @@ export default function Basemap3D(props: {
     () => ({
       margin: { l: 0, r: 0, t: 0, b: 0 },
       paper_bgcolor: "rgba(0,0,0,0)",
+      showlegend: true,
+      legend: {
+        x: 0.9,
+        y: 0.98,
+        xanchor: "left",
+        yanchor: "top",
+        bgcolor: "rgba(8,16,32,0.58)",
+        bordercolor: "rgba(255,255,255,0.20)",
+        borderwidth: 1,
+        font: { size: 15 },
+      } as any,
       // Preserve user camera/zoom across updates (e.g., SST animation frames).
       uirevision: "keep",
       scene: {
@@ -1663,7 +1895,14 @@ export default function Basemap3D(props: {
         aspectratio: { x: 1.1, y: 1.0, z: depthRatio },
       }
     }),
-    [depthRatio, fixedRanges.x, fixedRanges.y, fixedRanges.z, zAxisTicks.ticktext, zAxisTicks.tickvals]
+    [
+      depthRatio,
+      fixedRanges.x,
+      fixedRanges.y,
+      fixedRanges.z,
+      zAxisTicks.ticktext,
+      zAxisTicks.tickvals,
+    ]
   );
 
   const plotConfig = useMemo(
@@ -1746,7 +1985,7 @@ export default function Basemap3D(props: {
   }, []);
 
   useEffect(() => {
-    // Keep the current camera orientation while changing depth ratio.
+    // Keep the current camera orientation while changing data mode/layout/scaling controls.
     const Plotly = plotlyLibRef.current;
     const graphDiv = graphDivRef.current;
     if (!Plotly || !graphDiv || !didInitCameraRef.current) return;
@@ -1764,7 +2003,15 @@ export default function Basemap3D(props: {
     return () => {
       if (raf) window.cancelAnimationFrame(raf);
     };
-  }, [depthRatio]);
+  }, [
+    depthRatio,
+    depthWarp.deepRatio,
+    depthWarp.focusDepthM,
+    depthWarp.mode,
+    props.classLayer?.enabled,
+    props.horizontalField?.enabled,
+    props.transectField?.enabled,
+  ]);
 
   if (!Plot) {
     return (
