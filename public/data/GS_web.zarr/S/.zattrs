@@ -1,3 +1,9 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:de5654363419c44e50d37d05ff595f9090e36248cbc83464222cf7f512ba3955
-size 117
+{
+  "coordinates": "PHrefC drF iter rhoRef",
+  "_ARRAY_DIMENSIONS": [
+    "time",
+    "Z",
+    "lat",
+    "lon"
+  ]
+}

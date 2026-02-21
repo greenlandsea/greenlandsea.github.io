@@ -1,3 +1,7 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:5360c44f60b4c9a41caedf1e058bbd87baf2e18273b9b966ca8677ad84197c6a
-size 109
+{
+  "units": "seconds since 1993-08-01",
+  "calendar": "gregorian",
+  "_ARRAY_DIMENSIONS": [
+    "time"
+  ]
+}

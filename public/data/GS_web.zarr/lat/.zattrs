@@ -1,3 +1,6 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:cbdcf8c3ea5a60b3282c8c0373b4e49f84001429dfa123dd5e04f7cd21786cf5
-size 53
+{
+  "_ARRAY_DIMENSIONS": [
+    "lat",
+    "lon"
+  ]
+}

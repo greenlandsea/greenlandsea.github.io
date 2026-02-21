@@ -1,3 +1,27 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:7cd74bf91cd1881d7cbae19fcee443ab21a1f34c2717e467e74dfbefad9b248e
-size 346
+{
+  "shape": [
+    73,
+    72,
+    300,
+    300
+  ],
+  "chunks": [
+    1,
+    2,
+    300,
+    300
+  ],
+  "dtype": "<f4",
+  "fill_value": "NaN",
+  "order": "C",
+  "filters": null,
+  "dimension_separator": ".",
+  "compressor": {
+    "id": "blosc",
+    "cname": "zstd",
+    "clevel": 3,
+    "shuffle": 2,
+    "blocksize": 0
+  },
+  "zarr_format": 2
+}

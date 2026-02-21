@@ -1,3 +1,5 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:bf876c929437bf26bb3a7ab6ffbb97b8b6d0613fe686a32749b1a3cd23bf41a8
-size 43
+{
+  "_ARRAY_DIMENSIONS": [
+    "time"
+  ]
+}
